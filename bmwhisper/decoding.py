@@ -14,11 +14,25 @@ from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
 from .utils import compression_ratio
 
-from tpu_perf.infer import SGInfer
+def fp16_cast(arr:np.ndarray):
+  if arr.dtype == np.float16:
+    return arr.view(np.uint16)
+  else:
+    return arr
+
+def uint16_to_fp16(arr: np.ndarray):
+    if arr.dtype == np.uint16:
+        return arr.view(np.float16)
+    else:
+        return arr
+
+def compare_float16_error(arr1, arr2, threshold = 0.005):
+    diff = np.abs(arr1 - arr2)
+    if np.any(diff > threshold):
+        raise ValueError("Error threshold exceeded in float16 comparison")
 
 if TYPE_CHECKING:
     from .model import Whisper
-
 
 @torch.no_grad()
 def detect_language(
@@ -53,46 +67,32 @@ def detect_language(
     start_time = time.time()
     # skip encoder forward pass if already-encoded audio features were given
     if mel.shape[-2:] != (model.dims.n_audio_ctx, model.dims.n_audio_state):
-        if model.inference:
-            # import pdb; pdb.set_trace()
-            mel = mel.numpy()
-            _ = model.encoder_infer.put(mel)
-            _, result, _ = model.encoder_infer.get()
-            print(f"encoder infer time: {time.time() - start_time}")
-            model.time += time.time() - start_time
-            # import pdb; pdb.set_trace()
-            mel = torch.from_numpy(result[0])
-        else:
-            # import pdb; pdb.set_trace()
-            if model.export_onnx:
-                onnx_input_names = ["mel"]
-                onnx_output_names = ["audio_features",]
-                onnx_input_dict = {"mel":mel}
-                model_name= f"encoder_{model.model_name}_{model.beam_size}beam_{model.padding_size}pad"
+        # transform type from encoder inputs
+        # type
+        mel = mel.numpy().astype(np.float16)
+        mel = mel if mel.flags.c_contiguous else np.ascontiguousarray(mel)
 
-                np.savez(model_name + "_inputs.npz", **onnx_input_dict)
-                torch.onnx.export(
-                    model.encoder,
-                    (mel,),  # Pass the actual input data
-                    model_name + ".onnx",
-                    verbose=True,
-                    input_names=onnx_input_names,  # Provide input names
-                    output_names=onnx_output_names,  # Provide output names
-                    opset_version=15,  # ONNX opset version to use
-                )
-            mel = model.encoder(mel)
-        # mel = model.encoder(mel)
+        encoder_engine_graph_name = model.encoder_engine.get_graph_names()[0]
+        encoder_input_tensors_map = model.encoder_engine.create_input_tensors_map(encoder_engine_graph_name)
+        encoder_output_tensors_map = model.encoder_engine.create_output_tensors_map(encoder_engine_graph_name)
+
+        uint16_mel = fp16_cast(mel)
+        encoder_input_tensors_map[model.encoder_engine.get_input_names(encoder_engine_graph_name)[0]].update_data(uint16_mel);
+
+        model.encoder_engine.process(encoder_engine_graph_name,encoder_input_tensors_map,encoder_output_tensors_map)
+        mel_out_tensor = list(encoder_output_tensors_map.values())[0]
+        mel_out = torch.from_numpy(mel_out_tensor.asnumpy())
+
+        model.time += time.time() - start_time
         model.call_encoder += 1
-        print(f"detect_language encoder time: {time.time() - start_time}")
+        # print(f"detect_language encoder time: {time.time() - start_time}")
 
     # forward pass using a single token, startoftranscript
-    n_audio = mel.shape[0]
+    n_audio = mel_out.shape[0]
     x = torch.tensor([[tokenizer.sot]] * n_audio)  # [n_audio, 1]
-    # import pdb; pdb.set_trace()
     start_time = time.time()
-    logits = model.logits(x, mel)[:, 0] # TODO: export model
-    print(f"logits time: {time.time() - start_time}")
-    # logits = model.logits_with_positional_embedding_firstly(x, mel)[:, 0]
+    logits = model.logits(x, mel_out)[:, 0].float()
+    # print(f"logits time: {time.time() - start_time}")
 
     # collect detected languages; suppress all non-language tokens
     mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -149,7 +149,6 @@ class DecodingOptions:
     max_initial_timestamp: Optional[float] = 1.0
 
     # implementation details
-    fp16: bool = True  # use fp16 for most of the calculation
     padding_size: int = 448 # max pre-allocation of key-value cache
 
 @dataclass(frozen=True)
@@ -171,11 +170,11 @@ class Inference:
         raise NotImplementedError
 
     def rearrange_kv_cache(
-            self, 
-            source_indices, 
-            self_attention_kcache: Tensor, 
-            self_attention_vcache: Tensor, 
-            cross_attention_kcache: Tensor, 
+            self,
+            source_indices,
+            self_attention_kcache: Tensor,
+            self_attention_vcache: Tensor,
+            cross_attention_kcache: Tensor,
             cross_attention_vcache: Tensor
         ) -> None:
         """Update the key-value cache according to the updated beams"""
@@ -185,311 +184,29 @@ class Inference:
         """Clean up any resources or hooks after decoding is finished"""
         pass
 
-class LogitsInferenceLoop(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model: "Whisper" = model
-        self.decoder = model.decoder
-        self.embedding = model.decoder.token_embedding
-        self.blocks = model.decoder.blocks
-        self.dims = model.dims
-        self.n_state = self.dims.n_text_state
-        self.n_head = self.dims.n_text_head
-        self.scale = (self.n_state // self.n_head) ** -0.25
-    
-    def forward(
-            self, 
-            x, 
-            xa, 
-            positional_embedding, 
-            mask, 
-        ) -> Tensor:
-        x_embedding = self.model.decoder.token_embedding(x)
-        x = x_embedding + positional_embedding
-        i = 0
-
-        for block in self.blocks:
-            attn_ln_x = block.attn_ln(x)
-            q = block.attn.query(attn_ln_x)
-            k = block.attn.key(attn_ln_x)
-            v = block.attn.value(attn_ln_x)
-
-            q = q * self.scale
-            k = k * self.scale
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            qk = q @ k
-            qk = qk + mask.permute(0, 2, 1, 3)
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.attn.out(wv)
-            
-            x = x + tmp_out
-            cross_attn_ln_x = block.cross_attn_ln(x)
-            q = block.cross_attn.query(cross_attn_ln_x)
-            k = block.cross_attn.key(xa)
-            v = block.cross_attn.value(xa)
-
-            q = q * self.scale
-            k = k * self.scale
-
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-            qk = q @ k
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.cross_attn.out(wv)
-            x = x + tmp_out
-            x = x + block.mlp(block.mlp_ln(x))
-            i += 1
-        x = self.decoder.ln(x)[:, -1:]
-        logits = (
-            x @ torch.transpose(self.decoder.token_embedding.weight, 0, 1)
-        ).float()
-        return logits[:, -1]
-
-class LogitsInferenceFirstlyEmbedding(nn.Module):
-    def __init__(self, token_embedding):
-        super().__init__()
-        self.token_embedding = token_embedding
-
-    def forward(self, x, positional_embedding):
-        return self.token_embedding(x) + positional_embedding
-
-class LogitsInferenceFirstlyAttentionBlock(nn.Module):
-    def __init__(self, block, dims):
-        super().__init__()
-        self.block = block
-        self.dims = dims
-        self.n_state = self.dims.n_text_state
-        self.n_head = self.dims.n_text_head
-        self.scale = (self.n_state // self.n_head) ** -0.25
-
-    def forward(self, x, xa, mask) -> Tensor:
-        attn_ln_x = self.block.attn_ln(x)
-        q = self.block.attn.query(attn_ln_x)
-        sattn_k = self.block.attn.key(attn_ln_x)
-        sattn_v = self.block.attn.value(attn_ln_x)
-
-        q = q * self.scale
-        k = sattn_k * self.scale
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-        v = sattn_v.view(*sattn_v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-        qk = q @ k
-        qk = qk + mask.permute(0, 2, 1, 3)
-        w = F.softmax(qk, dim=-1)
-        wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-
-        x = x + self.block.attn.out(wv)
-        cross_attn_ln_x = self.block.cross_attn_ln(x)
-        q = self.block.cross_attn.query(cross_attn_ln_x)
-        cattn_k = self.block.cross_attn.key(xa)
-        cattn_v = self.block.cross_attn.value(xa)
-
-        q = q * self.scale
-        k = cattn_k * self.scale
-        v = cattn_v
-
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-        qk = q @ k
-        w = F.softmax(qk, dim=-1)
-        wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-        x = x + self.block.cross_attn.out(wv)
-        x = x + self.block.mlp(self.block.mlp_ln(x))
-        return x, sattn_k, sattn_v, cattn_k, cattn_v
-
-class LogitsInferenceFirstlyMainProcess(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model: "Whisper" = model
-        self.decoder = model.decoder
-        self.embedding = model.decoder.token_embedding
-        self.blocks = model.decoder.blocks
-        self.dims = model.dims
-        self.n_state = self.dims.n_text_state
-        self.n_head = self.dims.n_text_head
-        self.scale = (self.n_state // self.n_head) ** -0.25
-        self.use_kvcache = model.use_kvcache
-    
-    def forward(
-            self, 
-            x, 
-            xa, 
-            positional_embedding, 
-            mask, 
-        ) -> Tensor:
-        x_embedding = self.model.decoder.token_embedding(x)
-        x = x_embedding + positional_embedding
-        i = 0
-        if self.use_kvcache:
-            self_attention_kcache = []
-            self_attention_vcache = []
-            cross_attention_kcache = []
-            cross_attention_vcache = []
-
-        for block in self.blocks:
-            attn_ln_x = block.attn_ln(x)
-            q = block.attn.query(attn_ln_x)
-            k = block.attn.key(attn_ln_x)
-            v = block.attn.value(attn_ln_x)
-            if self.use_kvcache:
-                self_attention_kcache.append(k)
-                self_attention_vcache.append(v)
-
-            q = q * self.scale
-            k = k * self.scale
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            qk = q @ k
-            qk = qk + mask.permute(0, 2, 1, 3)
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.attn.out(wv)
-            
-            x = x + tmp_out
-            cross_attn_ln_x = block.cross_attn_ln(x)
-            q = block.cross_attn.query(cross_attn_ln_x)
-            k = block.cross_attn.key(xa)
-            v = block.cross_attn.value(xa)
-            if self.use_kvcache:
-                cross_attention_kcache.append(k)
-                cross_attention_vcache.append(v)
-
-            q = q * self.scale
-            k = k * self.scale
-
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-            qk = q @ k
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.cross_attn.out(wv)
-            x = x + tmp_out
-            x = x + block.mlp(block.mlp_ln(x))
-            i += 1
-        if self.use_kvcache:
-            return x, self_attention_kcache, self_attention_vcache, cross_attention_kcache, cross_attention_vcache
-        return x
-
-class LogitsInferenceFirstlyPostProcess(nn.Module):
-    def __init__(self, decoder, no_speech):
-        super().__init__()
-        self.ln = decoder.ln
-        self.token_embedding_weight = decoder.token_embedding.weight
-        self.no_speech = no_speech
-
-    def forward(self, x_sot, x_last):
-        x = torch.cat((x_sot, x_last), dim=1)
-        x = self.ln(x)
-        logits = (
-            x @ torch.transpose(self.token_embedding_weight, 0, 1)
-        ).float()
-        probs_at_sot = logits[:, 0].float().softmax(dim=-1)
-        no_speech_prob = probs_at_sot[:, self.no_speech]
-        return logits[:, -1], no_speech_prob
-
-class LogitsInferenceLoopWithKVCache(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.model: "Whisper" = model
-        self.decoder = model.decoder
-        self.embedding = model.decoder.token_embedding
-        self.blocks = model.decoder.blocks
-        self.dims = model.dims
-        self.n_state = self.dims.n_text_state
-        self.n_head = self.dims.n_text_head
-        self.scale = (self.n_state // self.n_head) ** -0.25
-    
-    def forward(
-            self, 
-            x, 
-            positional_embedding, 
-            mask, 
-            self_attention_kcache, 
-            self_attention_vcache, 
-            cross_attention_kcache, 
-            cross_attention_vcache
-        ) -> Tensor:
-        x_embedding = self.model.decoder.token_embedding(x)
-        x = x_embedding + positional_embedding
-        i = 0
-        sattn_kcache = []
-        sattn_vcache = []
-
-        for block in self.blocks:
-            attn_ln_x = block.attn_ln(x)
-            q = block.attn.query(attn_ln_x)
-            k = torch.cat([self_attention_kcache[i], block.attn.key(attn_ln_x)], dim=1)
-            v = torch.cat([self_attention_vcache[i], block.attn.value(attn_ln_x)], dim=1)
-
-            # renew kv cache
-            sattn_kcache.append(k)
-            sattn_vcache.append(v)
-
-            q = q * self.scale
-            k = k * self.scale
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-            qk = q @ k
-            qk = qk + mask.permute(0, 2, 1, 3)
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.attn.out(wv)
-            
-            x = x + tmp_out
-            cross_attn_ln_x = block.cross_attn_ln(x)
-            q = block.cross_attn.query(cross_attn_ln_x)
-            k = cross_attention_kcache[i]
-            v = cross_attention_vcache[i]
-
-            q = q * self.scale
-            k = k * self.scale
-            q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1)
-            v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
-
-            qk = q @ k
-            w = F.softmax(qk, dim=-1)
-            wv = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
-            tmp_out = block.cross_attn.out(wv)
-            x = x + tmp_out
-            x = x + block.mlp(block.mlp_ln(x))
-            i += 1
-        x = self.decoder.ln(x)[:, -1:]
-        logits = (
-            x @ torch.transpose(self.decoder.token_embedding.weight, 0, 1)
-        ).float()
-        
-        return logits[:, -1], sattn_kcache, sattn_vcache
 
 class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
 
     def rearrange_kv_cache(
-            self, 
-            source_indices, 
-            self_attention_kcache: Tuple[Tensor], 
-            self_attention_vcache: Tuple[Tensor], 
+            self,
+            source_indices,
+            self_attention_kcache: Tuple[Tensor] = None,
+            self_attention_vcache: Tuple[Tensor] = None,
         ):
         if source_indices != list(range(len(source_indices))):
-            for i in range(len(self_attention_kcache)):
-                self_attention_kcache[i] = self_attention_kcache[i][source_indices]
-                self_attention_vcache[i] = self_attention_vcache[i][source_indices]
+            start_time = time.time()
+            indices = np.array(source_indices, dtype=np.int32)
+            indices = indices if indices.flags.contiguous else indices.copy()
+            self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[0]][self.model.kvcache_rearrange_engine_list[0].get_input_names(self.model.kvcache_rearrange_engine_list[0].get_graph_names()[0])[1]].update_data(indices)
 
+            for i in range(2 * self.model.dims.n_text_layer):
+                self.model.kvcache_rearrange_engine_list[i].process(self.model.kvcache_rearrange_engine_list[i].get_graph_names()[0], self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[i]], self.model.kvcache_rearrange_output_dict[self.model.kvcache_rearrange_engine_list[i]])
+
+            self.model.time += time.time() - start_time
+            self.model.call_kvcache_rearrange += 2 * self.model.dims.n_text_layer
+            return
 
 class SequenceRanker:
     def rank(
@@ -533,10 +250,10 @@ class TokenDecoder:
         """Initialize any stateful variables for decoding a new sequence"""
 
     def update(
-        self, 
-        tokens: Tensor, 
-        logits: Tensor, 
-        sum_logprobs: Tensor, 
+        self,
+        tokens: Tensor,
+        logits: Tensor,
+        sum_logprobs: Tensor,
     ) -> Tuple[Tensor, bool]:
         """Specify how to select the next token, based on the current trace and logits
 
@@ -593,10 +310,12 @@ class GreedyDecoder(TokenDecoder):
         self.eot = eot
 
     def update(
-        self, 
-        tokens: Tensor, 
-        logits: Tensor, 
-        sum_logprobs: Tensor, 
+        self,
+        tokens: Tensor,
+        logits: Tensor,
+        sum_logprobs: Tensor,
+        self_attention_kcache: Tensor = None,
+        self_attention_vcache: Tensor = None,
     ) -> Tuple[Tensor, bool]:
         if self.temperature == 0:
             next_tokens = logits.argmax(dim=-1)
@@ -642,12 +361,12 @@ class BeamSearchDecoder(TokenDecoder):
         self.finished_sequences = None
 
     def update(
-        self, 
-        tokens: Tensor, 
-        logits: Tensor, 
-        sum_logprobs: Tensor, 
-        self_attention_kcache: Tensor = None, 
-        self_attention_vcache: Tensor = None, 
+        self,
+        tokens: Tensor,
+        logits: Tensor,
+        sum_logprobs: Tensor,
+        self_attention_kcache: Tensor = None,
+        self_attention_vcache: Tensor = None,
     ) -> Tuple[Tensor, bool]:
         if tokens.shape[0] % self.beam_size != 0:
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
@@ -688,12 +407,16 @@ class BeamSearchDecoder(TokenDecoder):
             finished_sequences.append(finished)
 
         tokens = torch.tensor(next_tokens, device=tokens.device)
-        if self_attention_kcache is not None:
+        # import pdb; pdb.set_trace()
+
+        if self_attention_kcache:
             self.inference.rearrange_kv_cache(
-                source_indices, 
-                self_attention_kcache, 
-                self_attention_vcache, 
+                source_indices,
+                self_attention_kcache,
+                self_attention_vcache,
             )
+        else:
+            self.inference.rearrange_kv_cache(source_indices)
 
         # add newly finished sequences to self.finished_sequences
         assert len(self.finished_sequences) == len(finished_sequences)
@@ -844,7 +567,7 @@ class DecodingTask:
 
     def __init__(self, model: "Whisper", options: DecodingOptions):
         self.model = model
-        
+
         language = options.language or "en"
         tokenizer = get_tokenizer(
             model.is_multilingual, language=language, task=options.task
@@ -869,23 +592,6 @@ class DecodingTask:
 
         # inference: implements the forward pass through the decoder, including kv caching
         self.inference = PyTorchInference(model, len(self.initial_tokens))
-
-        # Inference module with torch for tracing model
-        if not self.model.inference:
-            model.eval()
-            # no kv cache inference
-            self.inference_main_process = LogitsInferenceFirstlyMainProcess(model)
-            self.inference_post_process = LogitsInferenceFirstlyPostProcess(model.decoder, self.tokenizer.no_speech)
-            if self.model.use_kvcache:
-                self.inference_loop = LogitsInferenceLoopWithKVCache(model)
-            else:
-                self.inference_loop = LogitsInferenceLoop(model)
-
-            # infernece with kv cache
-            # self.inference_firstly = LogitsInferenceFirstly(model)
-            # self.inference_firstly_seperate = LogitsInferenceFirstlySeperate(model)
-            # self.inference_firstly_main_process = LogitsInferenceFirstlyMainProcess(model)
-            # self.inference_firstly_after_process = LogitsInferenceFirstlyAfterProcess(model.decoder, self.tokenizer.no_speech)
 
         # sequence ranker: implements how to rank a group of sampled sequences
         self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
@@ -990,8 +696,7 @@ class DecodingTask:
         return tuple(sorted(set(suppress_tokens)))
 
     def _get_audio_features(self, mel: Tensor):
-        if self.options.fp16:
-            mel = mel.half()
+        mel = mel.half()
 
         if mel.shape[-2:] == (
             self.model.dims.n_audio_ctx,
@@ -1001,26 +706,25 @@ class DecodingTask:
             audio_features = mel
         else:
             start_time = time.time()
-            if self.model.inference:
-                mel = mel.numpy()
-                _ = self.model.encoder_infer.put(mel)
-                _, result, _ = self.model.encoder_infer.get()
-                print(f"encoder time: {time.time() - start_time}")
-                self.model.time += time.time() - start_time
-                audio_features = torch.from_numpy(result[0])
-            else:
-                audio_features = self.model.encoder(mel)
-            # audio_features = self.model.encoder(mel)
-            self.model.call_encoder +=1
-            print(f"_get_audio_features encoder time: {time.time() - start_time}")
 
-        # TODO check dtype
-        # if audio_features.dtype != (
-        #     torch.float16 if self.options.fp16 else torch.float32
-        # ):
-        #     return TypeError(
-        #         f"audio_features has an incorrect dtype: {audio_features.dtype}"
-        #     )
+            mel = mel.numpy().astype(np.float16)
+            mel = mel if mel.flags.c_contiguous else np.ascontiguousarray(mel)
+
+            # sail
+            encoder_engine_graph_name = self.model.encoder_engine.get_graph_names()[0]
+            encoder_input_tensors_map = self.model.encoder_engine.create_input_tensors_map(encoder_engine_graph_name)
+            encoder_output_tensors_map = self.model.encoder_engine.create_output_tensors_map(encoder_engine_graph_name)
+
+            uint16_mel = fp16_cast(mel)
+            encoder_input_tensors_map[self.model.encoder_engine.get_input_names(encoder_engine_graph_name)[0]].update_data(uint16_mel);
+
+            self.model.encoder_engine.process(encoder_engine_graph_name,encoder_input_tensors_map,encoder_output_tensors_map)
+            mel_out_tensor = list(encoder_output_tensors_map.values())[0]
+
+            audio_features = torch.from_numpy(mel_out_tensor.asnumpy())
+            self.model.call_encoder +=1
+            self.model.time += time.time() - start_time
+            # print(f"_get_audio_features encoder time: {time.time() - start_time}")
 
         return audio_features
 
@@ -1037,232 +741,145 @@ class DecodingTask:
                 tokens[:, self.sot_index + 1] = lang_tokens  # write language tokens
 
         return languages, lang_probs
-    
-    def _main_loop(self, audio_features: Tensor, tokens: Tensor):
-        print("{:=^80}".format(f" start main_loop {self.model.main_loop_cnt} "))
+
+    def _main_loop_sail(self, audio_features: Tensor, tokens: Tensor):
+        # print("{:=^100}".format(f" start main_loop {self.model.main_loop_cnt} "))
         self.model.main_loop_cnt += 1
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
         initial_tokens_length = len(self.initial_tokens)
-
         padding_num = self.padding_size
-        # padding_num_with_kvcache = self.padding_size
 
         attention_mask_firstly = torch.empty(padding_num, padding_num).fill_(-10000).triu_(1)
-        attention_mask_with_kvcache = torch.empty(padding_num, padding_num).fill_(-10000).triu_(1)
-        # attention_mask_with_kvcache = torch.empty(padding_num_with_kvcache, padding_num_with_kvcache).fill_(-10000).triu_(1)
+        attention_mask_with_kvcache_max = torch.empty(448, 448).fill_(-10000).triu_(1)
+        attention_mask_with_kvcache = attention_mask_with_kvcache_max[-padding_num:, -padding_num:]
         loop_start_time = time.time()
+
 
         try:
             for i in range(self.sample_len):
-                if i == 0 or not self.model.use_kvcache:
+                if i == 0:
                     tokens_input = F.pad(tokens, (padding_num - tokens.shape[-1], 0, 0, 0), value=0)
                     positional_embedding_input = F.pad(self.model.positional_embedding[:i+initial_tokens_length], (0, 0, padding_num - initial_tokens_length - i, 0), value=0)
                     mask = F.pad(attention_mask_firstly[:tokens.shape[-1], :tokens.shape[-1]], (padding_num - tokens.shape[-1], 0, 0, 0), value=-10000)
                     mask = F.pad(mask, (0, 0, padding_num - tokens.shape[-1], 0), value=0)
-                    mask = mask.reshape(1, 1, *mask.shape).repeat(n_batch, self.n_text_head, 1, 1).permute(0, 2, 1, 3)
+                    mask = mask.reshape(1, 1, *mask.shape).repeat(n_batch, self.n_text_head, 1, 1).permute(0, 2, 1, 3).contiguous()
                 else:
                     tokens_input = tokens[:, -1:]
                     offset = i + initial_tokens_length - 1
                     positional_embedding_input = self.model.positional_embedding[offset:offset+1]
                     mask = attention_mask_with_kvcache[offset:offset+1].flip(1)
-                    mask = mask.reshape(1, 1, *mask.shape).repeat(n_batch, self.n_text_head, 1, 1).permute(0, 2, 1, 3)
+                    mask = mask.reshape(1, 1, *mask.shape).repeat(n_batch, self.n_text_head, 1, 1).permute(0, 2, 1, 3).contiguous()
+                # import pdb; pdb.set_trace()
 
                 if i == 0:
-                    if self.model.inference:
-                        bmodel_input = (tokens_input.numpy().astype(np.int32), audio_features.numpy(), positional_embedding_input.numpy(), mask.numpy(),)
-                        start_time = time.time()
-                        _ = self.model.decoder_main_infer.put(*bmodel_input)
-                        _, results, _ = self.model.decoder_main_infer.get()
-                        self.model.time += time.time() - start_time
-                        x = results[0]
-                        if self.model.use_kvcache:
-                            self_attention_kcache = results[1:1+self.n_text_layer]
-                            self_attention_vcache = results[1+self.n_text_layer:1+self.n_text_layer*2]
-                            cross_attention_kcache = results[1+self.n_text_layer*2:1+self.n_text_layer*3]
-                            cross_attention_vcache = results[1+self.n_text_layer*3:]
-                        x_sot = x[:, padding_num - initial_tokens_length + self.sot_index:padding_num - initial_tokens_length + self.sot_index + 1]
-                        x_last = x[:, -1:]
-                        bmodel_input = (x_sot, x_last)
-                        _ = self.model.decoder_post_infer.put(*bmodel_input)
-                        _, results, _ = self.model.decoder_post_infer.get()
-                        self.model.time += time.time() - start_time
-                        logits = torch.from_numpy(results[0])
-                        no_speech_probs = results[1].tolist()
-                        # import pdb; pdb.set_trace()
-                    else:
-                        if self.model.export_onnx:
-                            onnx_input = (tokens_input, audio_features, positional_embedding_input, mask,)
-                            onnx_input_names = ["tokens_input", "audio_features", "positional_embedding_input", "mask"]
-                            onnx_output_names = ["x",]
-                            onnx_input_dict = {}
-                            for name, value in zip(onnx_input_names, onnx_input):
-                                onnx_input_dict[name] = value
-                            if self.model.use_kvcache:
-                                model_name = f"decoder_main_with_kvcache_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad"
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"self_attn_kcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"self_attn_vcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"cross_attn_kcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"cross_attn_vcache_in.{idx}")
-                            else:
-                                model_name = f"decoder_main_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad"
-                            np.savez(model_name + "_inputs.npz", **onnx_input_dict)
-                            torch.onnx.export(
-                                self.inference_main_process,
-                                onnx_input,  # Pass the actual input data
-                                model_name + ".onnx",
-                                verbose=True,
-                                input_names=onnx_input_names,  # Provide input names
-                                output_names=onnx_output_names,  # Provide output names
-                                opset_version=15,  # ONNX opset version to use
-                            )
-                        if self.model.use_kvcache:
-                            x, self_attention_kcache, self_attention_vcache, cross_attention_kcache, cross_attention_vcache = self.inference_main_process(
-                                tokens_input, 
-                                audio_features, 
-                                positional_embedding_input, 
-                                mask, 
-                                )
-                        else:
-                            x = self.inference_main_process(
-                                tokens_input, 
-                                audio_features, 
-                                positional_embedding_input, 
-                                mask, 
-                                )
-                        x_sot = x[:, padding_num - initial_tokens_length + self.sot_index:padding_num - initial_tokens_length + self.sot_index + 1]
-                        x_last = x[:, -1:]
-                        if self.model.export_onnx:
-                            onnx_input = (x_sot, x_last)
-                            onnx_input_names = ["x_sot", "x_last"]
-                            onnx_output_names = ["logits", "no_speech_probs"]
-                            onnx_input_dict = {}
-                            for name, value in zip(onnx_input_names, onnx_input):
-                                onnx_input_dict[name] = value
-                            np.savez(f"decoder_post_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad_inputs.npz", **onnx_input_dict)
-                            torch.onnx.export(
-                                    self.inference_post_process,
-                                    onnx_input,  # Pass the actual input data
-                                    f"decoder_post_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad.onnx",
-                                    verbose=True,
-                                    input_names=onnx_input_names,  # Provide input names
-                                    output_names=onnx_output_names,  # Provide output names
-                                    opset_version=15,  # ONNX opset version to use
-                                )
-                        logits, no_speech_probs = self.inference_post_process(x_sot, x_last)
-                        no_speech_probs = no_speech_probs.tolist()
-                    if self.model.use_kvcache:
-                        for idx in range(len(self_attention_kcache)):
-                            self_attention_kcache[idx] = self_attention_kcache[idx][:, 1:]
-                            self_attention_vcache[idx] = self_attention_vcache[idx][:, 1:]
+                    start_time = time.time()
+                    # type transform for decoder_main inputs
+                    tokens_input = tokens_input.numpy().astype(np.int32)
+                    audio_features = audio_features.numpy().astype(np.float16)
+                    positional_embedding_input = positional_embedding_input.numpy().astype(np.float16)
+                    mask = mask.numpy().astype(np.float16)
+
+                    tokens_input = tokens_input if tokens_input.flags.c_contiguous else np.ascontiguousarray(tokens_input)
+                    audio_features = audio_features if audio_features.flags.c_contiguous else np.ascontiguousarray(audio_features)
+                    positional_embedding_input = positional_embedding_input if positional_embedding_input.flags.c_contiguous else np.ascontiguousarray(positional_embedding_input)
+                    mask = mask if mask.flags.c_contiguous else np.ascontiguousarray(mask)
+
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[0]].update_data(tokens_input)
+
+                    uint16_audio_features = fp16_cast(audio_features)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[1]].update_data(uint16_audio_features)
+
+                    uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[2]].update_data(uint16_positional_embedding_input)
+
+                    uint16_mask = fp16_cast(mask)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[3]].update_data(uint16_mask)
+
+                    self.model.decoder_main_engine.process(self.model.decoder_main_graph_name, self.model.decoder_main_input_tensors_map,self.model.decoder_main_output_tensors_map)
+
+                    x_tensor = self.model.decoder_main_output_tensors_map[self.model.decoder_main_engine.get_output_names(self.model.decoder_main_graph_name)[0]]
+                    # compare_float16_error(uint16_to_fp16(x_tensor.asnumpy()), x)
+
+                    x = uint16_to_fp16(x_tensor.asnumpy())
+                    # get input data for decoder_post
+                    # this process is dynamic
+                    x_sot = x[:, padding_num - initial_tokens_length + self.sot_index:padding_num - initial_tokens_length + self.sot_index + 1].copy()
+                    x_last = x[:, -1:].copy()
+
+
+                    decoder_post_graph_name = self.model.decoder_post_engine.get_graph_names()[0]
+                    decoder_post_input_tensors_map = self.model.decoder_post_engine.create_input_tensors_map(decoder_post_graph_name)
+                    decoder_post_output_tensors_map = self.model.decoder_post_engine.create_output_tensors_map(decoder_post_graph_name)
+
+                    uint16_x_sot = fp16_cast(x_sot)
+                    decoder_post_input_tensors_map[self.model.decoder_post_engine.get_input_names(decoder_post_graph_name)[0]].update_data(uint16_x_sot);
+                    uint16_x_last = fp16_cast(x_last)
+                    decoder_post_input_tensors_map[self.model.decoder_post_engine.get_input_names(decoder_post_graph_name)[1]].update_data(uint16_x_last);
+
+                    self.model.decoder_post_engine.process(decoder_post_graph_name,decoder_post_input_tensors_map,decoder_post_output_tensors_map)
+                    logits_tensor = decoder_post_output_tensors_map[self.model.decoder_post_engine.get_output_names(decoder_post_graph_name)[0]]
+                    no_speech_probs_tensor = decoder_post_output_tensors_map[self.model.decoder_post_engine.get_output_names(decoder_post_graph_name)[1]]
+
+                    logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
+                    no_speech_probs = uint16_to_fp16(no_speech_probs_tensor.asnumpy()).tolist()
 
                     self.model.call_decoder_firstly += 1
+                    self.model.time += time.time() - start_time
 
                 else:
-                    if self.model.inference:
-                        if self.model.use_kvcache:
-                            bmodel_input = (tokens_input.numpy().astype(np.int32), positional_embedding_input.numpy(), mask.numpy(), *self_attention_kcache, *self_attention_vcache, *cross_attention_kcache, *cross_attention_vcache,)
-                        else:
-                            bmodel_input = (tokens_input.numpy().astype(np.int32), audio_features.numpy(), positional_embedding_input.numpy(), mask.numpy(),)
-                        start_time = time.time()
-                        _ = self.model.decoder_loop_infer.put(*bmodel_input)
-                        _, results, _ = self.model.decoder_loop_infer.get()
-                        self.model.time += time.time() - start_time
-                        logits = torch.from_numpy(results[0])
-                        if self.model.use_kvcache:
-                            self_attention_kcache = results[1:1+self.n_text_layer]
-                            self_attention_vcache = results[1+self.n_text_layer:1+self.n_text_layer*2]
-                    else:
-                        if self.model.export_onnx:
-                            if self.model.use_kvcache:
-                                onnx_input = (tokens_input, positional_embedding_input, mask, self_attention_kcache, self_attention_vcache, cross_attention_kcache, cross_attention_vcache,)
-                                npz_input = (tokens_input, positional_embedding_input, mask, *self_attention_kcache, *self_attention_vcache, *cross_attention_kcache, *cross_attention_vcache,)
-                                onnx_input_names = ["tokens_input", "positional_embedding_input", "mask",]
-                                onnx_output_names = ["logits",]
-                                model_name = f"decoder_loop_with_kvcache_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad"
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_input_names.append(f"self_attn_kcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_input_names.append(f"self_attn_vcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_input_names.append(f"cross_attn_kcache_in.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_input_names.append(f"cross_attn_vcache_in.{idx}")
+                    start_time = time.time()
+                    # type transform for decoder_loop inputs
+                    tokens_input = tokens_input.numpy().astype(np.int32)
+                    positional_embedding_input = positional_embedding_input.numpy().astype(np.float16)
+                    mask = mask.numpy().astype(np.float16)
 
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"self_attn_kcache_out.{idx}")
-                                for idx in range(self.model.dims.n_text_layer):
-                                    onnx_output_names.append(f"self_attn_vcache_out.{idx}")
-                            else:
-                                onnx_input = (tokens_input, audio_features, positional_embedding_input, mask,)
-                                npz_input = (tokens_input, audio_features, positional_embedding_input, mask,)
-                                onnx_input_names = ["tokens_input", "audio_features", "positional_embedding_input", "mask",]
-                                onnx_output_names = ["logits",]
-                                model_name = f"decoder_loop_{self.model.model_name}_{self.model.beam_size}beam_{padding_num}pad"
-                            onnx_input_dict = {}
-                            for name, value in zip(onnx_input_names, npz_input):
-                                onnx_input_dict[name] = value
-                            np.savez(model_name + "_inputs.npz", **onnx_input_dict)
-                            torch.onnx.export(
-                                self.inference_loop,
-                                onnx_input,  # Pass the actual input data
-                                model_name + ".onnx",
-                                verbose=True,
-                                input_names=onnx_input_names,  # Provide input names
-                                output_names=onnx_output_names,  # Provide output names
-                                opset_version=15,  # ONNX opset version to use
-                            )
-                            exit()
-                        else:
-                            if self.model.use_kvcache:
-                                logits, self_attention_kcache, self_attention_vcache = self.inference_loop(
-                                    tokens_input, 
-                                    positional_embedding_input, 
-                                    mask, 
-                                    self_attention_kcache, 
-                                    self_attention_vcache, 
-                                    cross_attention_kcache, 
-                                    cross_attention_vcache
-                                )
-                            else:
-                                logits = self.inference_loop(tokens_input, audio_features, positional_embedding_input, mask)
-                    if self.model.use_kvcache:
-                        for idx in range(len(self_attention_kcache)):
-                            self_attention_kcache[idx] = self_attention_kcache[idx][:, 1:]
-                            self_attention_vcache[idx] = self_attention_vcache[idx][:, 1:]
+                    tokens_input = tokens_input if tokens_input.flags.contiguous else np.ascontiguousarray(tokens_input)
+                    positional_embedding_input = positional_embedding_input if positional_embedding_input.flags.contiguous else np.ascontiguousarray(positional_embedding_input)
+                    mask = mask if mask.flags.contiguous else np.ascontiguousarray(mask)
+
+                    # sail
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[0]].update_data(tokens_input)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[0]].sync_s2d()
+
+                    uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[1]].update_data(uint16_positional_embedding_input)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[1]].sync_s2d()
+
+                    uint16_mask = fp16_cast(mask)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[2]].update_data(uint16_mask)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[2]].sync_s2d()
+
+                    self.model.decoder_loop_engine.process(self.model.decoder_loop_graph_name, self.model.decoder_loop_input_tensors_map, self.model.decoder_loop_output_tensors_map)
+
+
+                    logits_tensor = self.model.decoder_loop_output_tensors_map[self.model.decoder_loop_engine.get_output_names(self.model.decoder_loop_graph_name)[0]]
+
+                    logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
 
                     self.model.call_decoder_loop += 1
+                    self.model.time += time.time() - start_time
 
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
                     logit_filter.apply(logits, tokens)
 
                 # expand the tokens tensor with the selected next tokens
-                if self.model.use_kvcache:
-                    tokens, completed = self.decoder.update(tokens, 
-                                                            logits, 
-                                                            sum_logprobs, 
-                                                            self_attention_kcache, 
-                                                            self_attention_vcache, 
-                                                        )
-                else:
-                    tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                tokens, completed = self.decoder.update(tokens,
+                                                        logits.float(),
+                                                        sum_logprobs,
+                                                    )
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
         finally:
             pass
-        print(f'loop cost time: {time.time() - loop_start_time}')
+        # print(f'loop cost time: {time.time() - loop_start_time}')
         return tokens, sum_logprobs, no_speech_probs
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
-        # import pdb; pdb.set_trace()
         self.decoder.reset()
         tokenizer: Tokenizer = self.tokenizer
         n_audio: int = mel.shape[0]
@@ -1272,6 +889,7 @@ class DecodingTask:
 
         # detect language if requested, overwriting the language token
         languages, language_probs = self._detect_language(audio_features, tokens) # encoder forward pass
+
         if self.options.task == "lang_id":
             return [
                 DecodingResult(
@@ -1286,7 +904,7 @@ class DecodingTask:
         tokens = tokens.repeat_interleave(self.n_group, dim=0).to(torch.int32)
 
         # call the main sampling loop
-        tokens, sum_logprobs, no_speech_probs = self._main_loop(audio_features, tokens) # decoder forward pass
+        tokens, sum_logprobs, no_speech_probs = self._main_loop_sail(audio_features, tokens) # decoder forward pass
 
         # reshape the tensors to have (n_audio, n_group) as the first two dimensions
         audio_features = audio_features[:: self.n_group]

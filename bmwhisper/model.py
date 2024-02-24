@@ -4,6 +4,7 @@ import base64
 import gzip
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
+import sophon.sail as sail
 
 import numpy as np
 import torch
@@ -14,8 +15,22 @@ from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
-from tpu_perf.infer import SGInfer
+def fp16_cast(arr:np.ndarray):
+  if arr.dtype == np.float16:
+    return arr.view(np.uint16)
+  else:
+    return arr
 
+def uint16_to_fp16(arr: np.ndarray):
+    if arr.dtype == np.uint16:
+        return arr.view(np.float16)
+    else:
+        return arr
+
+def compare_float16_error(arr1, arr2, threshold = 0.005):
+    diff = np.abs(arr1 - arr2)
+    if np.any(diff > threshold):
+        raise ValueError("Error threshold exceeded in float16 comparison")
 
 @dataclass
 class ModelDimensions:
@@ -197,10 +212,10 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-10000).triu_(1).flip(1)
 
         self.mask = mask
-    
+
     def embedding(self, x: Tensor):
         return self.token_embedding(x)
-    
+
     def attention(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         for block in self.blocks:
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
@@ -241,30 +256,10 @@ class Whisper(nn.Module):
         self.decoder_main_infer = None
         self.decoder_post_infer = None
         self.decoder_loop_infer = None
-        self.inference = args["inference"]
-        self.export_onnx = args["export_onnx"]
-        self.fp16 = args["fp16"]
         self.bmodel_dir = args["bmodel_dir"]
         self.beam_size = args["beam_size"]
-        self.use_kvcache = args["use_kvcache"]
-        self.split = args["split"]
         self.padding_size = args["padding_size"]
-
-        if not self.inference:
-            self.encoder = AudioEncoder(
-                self.dims.n_mels,
-                self.dims.n_audio_ctx,
-                self.dims.n_audio_state,
-                self.dims.n_audio_head,
-                self.dims.n_audio_layer,
-            )
-            self.decoder = TextDecoder(
-                self.dims.n_vocab,
-                self.dims.n_text_ctx,
-                self.dims.n_text_state,
-                self.dims.n_text_head,
-                self.dims.n_text_layer,
-            )
+        self.chip_mode = args["chip_mode"]
 
         # use the last half layers for alignment by default; see `set_alignment_heads()` below
         all_heads = torch.zeros(
@@ -278,34 +273,84 @@ class Whisper(nn.Module):
         assert os.path.exists(positional_embedding_path), f"{positional_embedding_path} not found"
         self.positional_embedding = torch.tensor(np.load(positional_embedding_path)["positional_embedding"])
 
-        ############################
-        ## BModel Loading
-        ############################
-        if self.inference:
-            if self.fp16:
-                dtype = "f16"
-            else:
-                dtype = "f32"
-            start_time = time.time()
-            encoder_bmodel_path = os.path.join(self.bmodel_dir, f"encoder_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-            assert os.path.exists(encoder_bmodel_path), f"{encoder_bmodel_path} not found"
-            self.encoder_infer = SGInfer(encoder_bmodel_path, 1, [0])
-            logits_decoder_bmodel_path = os.path.join(self.bmodel_dir, f"logits_decoder_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-            assert os.path.exists(logits_decoder_bmodel_path), f"{logits_decoder_bmodel_path} not found"
-            self.logits_decoder_infer = SGInfer(logits_decoder_bmodel_path, 1, [0])
-            decoder_post_bmodel_path = os.path.join(self.bmodel_dir, f"decoder_post_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-            self.decoder_post_infer = SGInfer(decoder_post_bmodel_path, 1, [0])
-            if self.use_kvcache:
-                decoder_main_bmodel_path = os.path.join(self.bmodel_dir, f"decoder_main_with_kvcache_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-                self.decoder_main_infer = SGInfer(decoder_main_bmodel_path, 1, [0])
-                decoder_loop_bmodel_path = os.path.join(self.bmodel_dir, f"decoder_loop_with_kvcache_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-                self.decoder_loop_infer = SGInfer(decoder_loop_bmodel_path, 1, [0])
-            else:
-                decoder_main_bmodel_path = os.path.join(self.bmodel_dir, f"decoder_main_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-                self.decoder_main_infer = SGInfer(decoder_main_bmodel_path, 1, [0])
-                decoder_loop_bmodel_path = os.path.join(self.bmodel_dir, f"decoder_loop_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel")
-                self.decoder_loop_infer = SGInfer(decoder_loop_bmodel_path, 1, [0])
-            print("--- %s seconds ---" % (time.time() - start_time))
+        ########################################
+        ## Using sail to load BModel
+        ########################################
+        start_time = time.time()
+        quant_str = "all_quant"
+        encoder_bmodel_path           = f"{quant_str}_encoder_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        logits_decoder_bmodel_path    = f"{quant_str}_logits_decoder_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        decoder_main_bmodel_path      = f"{quant_str}_decoder_main_with_kvcache_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        decoder_post_bmodel_path      = f"{quant_str}_decoder_post_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        decoder_loop_bmodel_path      = f"{quant_str}_decoder_loop_with_kvcache_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        kvcache_rearrange_bmodel_path = f"{quant_str}_kvcache_rearrange_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad_1684x_f16.bmodel"
+        encoder_bmodel_path           = os.path.join(self.bmodel_dir, encoder_bmodel_path)
+        logits_decoder_bmodel_path    = os.path.join(self.bmodel_dir, logits_decoder_bmodel_path)
+        decoder_main_bmodel_path      = os.path.join(self.bmodel_dir, decoder_main_bmodel_path)
+        decoder_post_bmodel_path      = os.path.join(self.bmodel_dir, decoder_post_bmodel_path)
+        decoder_loop_bmodel_path      = os.path.join(self.bmodel_dir, decoder_loop_bmodel_path)
+        kvcache_rearrange_bmodel_path = os.path.join(self.bmodel_dir, kvcache_rearrange_bmodel_path)
+        assert os.path.exists(encoder_bmodel_path), f"{encoder_bmodel_path} not found"
+        assert os.path.exists(logits_decoder_bmodel_path), f"{logits_decoder_bmodel_path} not found"
+        assert os.path.exists(decoder_main_bmodel_path), f"{decoder_main_bmodel_path} not found"
+        assert os.path.exists(decoder_post_bmodel_path), f"{decoder_post_bmodel_path} not found"
+        assert os.path.exists(decoder_loop_bmodel_path), f"{decoder_loop_bmodel_path} not found"
+        assert os.path.exists(kvcache_rearrange_bmodel_path), f"{kvcache_rearrange_bmodel_path} not found"
+
+        dev_id = 0
+        # initial encoder engine
+        self.encoder_engine = sail.Engine(encoder_bmodel_path, dev_id, sail.IOMode.SYSIO)
+
+        # initial logits_decoder engine
+        self.logits_decoder_engine = sail.Engine(logits_decoder_bmodel_path, dev_id, sail.IOMode.SYSIO)
+
+        # initial decoder_main engine
+        self.decoder_main_engine = sail.Engine(decoder_main_bmodel_path, dev_id, sail.IOMode.DEVIO)
+        self.decoder_main_graph_name = self.decoder_main_engine.get_graph_names()[0]
+        self.decoder_main_input_tensors_map = self.decoder_main_engine.create_input_tensors_map(self.decoder_main_graph_name)
+        self.decoder_main_output_tensors_map = self.decoder_main_engine.create_output_tensors_map(self.decoder_main_graph_name)
+
+        # initial decoder_post engine
+        self.decoder_post_engine = sail.Engine(decoder_post_bmodel_path, dev_id, sail.IOMode.SYSIO)
+
+        # initial decoder_loop engine
+        self.decoder_loop_engine = sail.Engine(decoder_loop_bmodel_path, dev_id, sail.IOMode.DEVIO)
+        self.decoder_loop_graph_name = self.decoder_loop_engine.get_graph_names()[0]
+        self.decoder_loop_input_tensors_map = self.decoder_loop_engine.create_input_tensors_map(self.decoder_loop_graph_name)
+        self.decoder_loop_output_tensors_map = self.decoder_loop_engine.create_output_tensors_map(self.decoder_loop_graph_name)
+
+        self.kvcache_rearrange_engine_list = []
+        self.kvcache_rearrange_input_dict = {}
+        self.kvcache_rearrange_output_dict = {}
+        for i in range(self.dims.n_text_layer * 2):
+            # initial kvcache_rearrange engine
+            kvcache_rearrange_engine = sail.Engine(kvcache_rearrange_bmodel_path, dev_id, sail.IOMode.DEVIO)
+            kvcache_rearrange_graph_name = kvcache_rearrange_engine.get_graph_names()[0]
+            kvcache_rearrange_input_tensors_map = kvcache_rearrange_engine.create_input_tensors_map(kvcache_rearrange_graph_name)
+            kvcache_rearrange_output_tensors_map = kvcache_rearrange_engine.create_output_tensors_map(kvcache_rearrange_graph_name)
+
+            kvcache_rearrange_input_tensors_map[kvcache_rearrange_engine.get_input_names(kvcache_rearrange_graph_name)[0]] = self.decoder_main_output_tensors_map[self.decoder_main_engine.get_output_names(self.decoder_main_graph_name)[i + 1]]
+
+            kvcache_rearrange_output_tensors_map[kvcache_rearrange_engine.get_output_names(kvcache_rearrange_graph_name)[0]] = kvcache_rearrange_input_tensors_map[kvcache_rearrange_engine.get_input_names(kvcache_rearrange_graph_name)[0]]
+
+            self.kvcache_rearrange_engine_list.append(kvcache_rearrange_engine)
+            self.kvcache_rearrange_input_dict[kvcache_rearrange_engine] = kvcache_rearrange_input_tensors_map
+            self.kvcache_rearrange_output_dict[kvcache_rearrange_engine] = kvcache_rearrange_output_tensors_map
+
+        for i in range(self.dims.n_text_layer * 4):
+            self.decoder_loop_input_tensors_map[self.decoder_loop_engine.get_input_names(self.decoder_loop_graph_name)[i + 3]] = self.decoder_main_output_tensors_map[self.decoder_main_engine.get_output_names(self.decoder_main_graph_name)[i + 1]]
+
+        for i in range(self.dims.n_text_layer * 2):
+            self.decoder_loop_output_tensors_map[self.decoder_loop_engine.get_output_names(self.decoder_loop_graph_name)[i + 1]] = self.decoder_loop_input_tensors_map[self.decoder_loop_engine.get_input_names(self.decoder_loop_graph_name)[i + 3]]
+
+        kvcache_rearrange_engine_base = self.kvcache_rearrange_engine_list[0]
+
+        for i in range(self.dims.n_text_layer * 2 - 1):
+            self.kvcache_rearrange_input_dict[self.kvcache_rearrange_engine_list[i + 1]][self.kvcache_rearrange_engine_list[i + 1].get_input_names(self.kvcache_rearrange_engine_list[i + 1].get_graph_names()[0])[1]] = self.kvcache_rearrange_input_dict[kvcache_rearrange_engine_base][kvcache_rearrange_engine_base.get_input_names(kvcache_rearrange_engine_base.get_graph_names()[0])[1]]
+
+        self.init_time = time.time() - start_time
+        print(f"\nTPU bmodel init time: {self.init_time}s")
+
         self.time = 0
         self.main_loop_cnt = 0
         self.call_encoder = 0
@@ -313,7 +358,27 @@ class Whisper(nn.Module):
         self.call_decoder_loop= 0
         self.call_decoder_firstly= 0
         self.call_decoder_with_kvcache = 0
+        self.call_kvcache_rearrange = 0
         self.max_ctx = 0
+
+    def init_cnt(self):
+        self.main_loop_cnt = 0
+        self.call_encoder = 0
+        self.call_logits_decoder= 0
+        self.call_decoder_loop= 0
+        self.call_decoder_firstly= 0
+        self.call_kvcache_rearrange = 0
+
+
+    def print_cnt(self):
+        def print_cnt(text, cnt, n):
+            print(f"{text:<{n}} {cnt}")
+        print()
+        print_cnt("Call encoder times:", self.call_encoder, 50)
+        print_cnt("Call logits decoder times:", self.call_logits_decoder, 50)
+        print_cnt("Call decoder firstly times:", self.call_decoder_firstly, 50)
+        print_cnt("Call decoder loop:", self.call_decoder_loop, 50)
+        print_cnt("Call kvcache rearrange times:", self.call_kvcache_rearrange, 50)
 
     def set_alignment_heads(self, dump: bytes):
         array = np.frombuffer(
@@ -326,51 +391,40 @@ class Whisper(nn.Module):
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder(mel)
-    
-    def logits_with_positional_embedding_firstly(self, tokens: torch.Tensor, audio_features: torch.Tensor):
-        return self.decoder.forward_with_positional_embedding_firstly(tokens, audio_features, self.positional_embedding[0 : 0 + tokens.shape[-1]])
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
-        print("{:=^80}".format(" model.logits "))
+        # print("{:=^100}".format(" model.logits "))
         # TODO: condition of multi-channel audio
-        if self.inference:
-            # import pdb; pdb.set_trace()
-            tokens = tokens.numpy().astype(np.int32)
-            audio_features = audio_features.numpy()
-            start_time = time.time()
-            _ = self.logits_decoder_infer.put(tokens, audio_features)
-            _, result, _ = self.logits_decoder_infer.get()
-            print(f"logits inference time: {time.time() - start_time} seconds")
-            self.time += time.time() - start_time
-            # import pdb; pdb.set_trace()
-            logits = torch.from_numpy(result[0])
-        else:
-            # import pdb; pdb.set_trace()
-            if self.export_onnx:
-                onnx_input_names = ["tokens", "audio_features"]
-                onnx_output_names = ["logits",]
-                onnx_input_dict = {"tokens":tokens, "audio_features":audio_features}
-                model_name= f"logits_decoder_{self.model_name}_{self.beam_size}beam_{self.padding_size}pad"
+        start_time = time.time()
 
-                np.savez(model_name + "_inputs.npz", **onnx_input_dict)
-                torch.onnx.export(
-                    self.decoder,
-                    (tokens, audio_features,),  # Pass the actual input data
-                    model_name + ".onnx",
-                    verbose=True,
-                    input_names=onnx_input_names,  # Provide input names
-                    output_names=onnx_output_names,  # Provide output names
-                    opset_version=15,  # ONNX opset version to use
-                )
-            logits = self.decoder(tokens, audio_features)
+        tokens = tokens.numpy().astype(np.int32)
+        audio_features = audio_features.numpy().astype(np.float16)
+        tokens = tokens if tokens.flags.c_contiguous else np.ascontiguousarray(tokens)
+        audio_features = audio_features if audio_features.flags.c_contiguous else np.ascontiguousarray(audio_features)
+
+        logits_decoder_graph_name = self.logits_decoder_engine.get_graph_names()[0]
+        logits_decoder_input_tensors_map = self.logits_decoder_engine.create_input_tensors_map(logits_decoder_graph_name)
+        logits_decoder_output_tensors_map = self.logits_decoder_engine.create_output_tensors_map(logits_decoder_graph_name)
+
+        logits_decoder_input_tensors_map[self.logits_decoder_engine.get_input_names(logits_decoder_graph_name)[0]].update_data(tokens)
+
+        unint16_audio_features = fp16_cast(audio_features)
+        logits_decoder_input_tensors_map[self.logits_decoder_engine.get_input_names(logits_decoder_graph_name)[1]].update_data(unint16_audio_features);
+
+        self.logits_decoder_engine.process(logits_decoder_graph_name,logits_decoder_input_tensors_map,logits_decoder_output_tensors_map)
+        logits_tensor = list(logits_decoder_output_tensors_map.values())[0]
+
+        logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
+
+        self.time += time.time() - start_time
+        # print(f"logits inference time: {time.time() - start_time} seconds")
         self.call_logits_decoder += 1
         return logits
-        # return self.decoder(tokens, audio_features)
 
     def forward(
         self, mel: torch.Tensor, tokens: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        print("{:=^80}".format(" model.forward "))
+        print("{:=^100}".format(" model.forward "))
         return self.decoder(tokens, self.encoder(mel))
 
     @property
@@ -380,47 +434,6 @@ class Whisper(nn.Module):
     @property
     def is_multilingual(self):
         return self.dims.n_vocab == 51865
-
-    def install_kv_cache_hooks(self, cache: Optional[dict] = None):
-        """
-        The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
-        tensors calculated for the previous positions. This method returns a dictionary that stores
-        all caches, and the necessary hooks for the key and value projection modules that save the
-        intermediate tensors to be reused during later calculations.
-
-        Returns
-        -------
-        cache : Dict[nn.Module, torch.Tensor]
-            A dictionary object mapping the key/value projection modules to its cache
-        hooks : List[RemovableHandle]
-            List of PyTorch RemovableHandle objects to stop the hooks to be called
-        """
-        cache = {**cache} if cache is not None else {}
-        hooks = []
-        c_num = []
-
-        def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.dims.n_text_ctx:
-                # save as-is, for the first token or cross attention
-                cache[module] = output
-            else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
-            return cache[module]
-
-        def install_hooks(layer: nn.Module):
-            if isinstance(layer, MultiHeadAttention):
-                # import pdb; pdb.set_trace()
-                hooks.append(layer.key.register_forward_hook(save_to_cache))
-                hooks.append(layer.value.register_forward_hook(save_to_cache))
-
-        def fn(module):
-            if isinstance(module, MultiHeadAttention):
-                c_num.append(1)
-        self.decoder.apply(fn)
-        print(f"decoder MultiHeadAttention num: {len(c_num)}") # 12
-
-        self.decoder.apply(install_hooks)
-        return cache, hooks
 
     detect_language = detect_language_function
     transcribe = transcribe_function
