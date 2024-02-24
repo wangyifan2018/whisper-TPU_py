@@ -15,6 +15,13 @@ from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
+data_type_map = {sail.Dtype.BM_FLOAT32 : np.float32,
+                 sail.Dtype.BM_FLOAT16 : np.float16,
+                 sail.Dtype.BM_INT8 : np.int8,
+                 sail.Dtype.BM_UINT8 : np.uint8,
+                 sail.Dtype.BM_INT32 : np.int32,
+                sail.Dtype.BM_UINT32 : np.uint32}
+
 def fp16_cast(arr:np.ndarray):
   if arr.dtype == np.float16:
     return arr.view(np.uint16)
@@ -300,22 +307,39 @@ class Whisper(nn.Module):
         dev_id = 0
         # initial encoder engine
         self.encoder_engine = sail.Engine(encoder_bmodel_path, dev_id, sail.IOMode.SYSIO)
+        self.encoder_engine_graph_name = self.encoder_engine.get_graph_names()[0]
+        self.encoder_input_names = self.encoder_engine.get_input_names(self.encoder_engine_graph_name)
+        self.encoder_input_tensors_map = self.encoder_engine.create_input_tensors_map(self.encoder_engine_graph_name)
+        self.encoder_output_tensors_map = self.encoder_engine.create_output_tensors_map(self.encoder_engine_graph_name)
 
         # initial logits_decoder engine
         self.logits_decoder_engine = sail.Engine(logits_decoder_bmodel_path, dev_id, sail.IOMode.SYSIO)
+        self.logits_decoder_graph_name = self.logits_decoder_engine.get_graph_names()[0]
+        self.logits_decoder_input_names = self.logits_decoder_engine.get_input_names(self.logits_decoder_graph_name)
+        self.logits_decoder_input_tensors_map = self.logits_decoder_engine.create_input_tensors_map(self.logits_decoder_graph_name)
+        self.logits_decoder_output_tensors_map = self.logits_decoder_engine.create_output_tensors_map(self.logits_decoder_graph_name)
 
         # initial decoder_main engine
         self.decoder_main_engine = sail.Engine(decoder_main_bmodel_path, dev_id, sail.IOMode.DEVIO)
         self.decoder_main_graph_name = self.decoder_main_engine.get_graph_names()[0]
+        self.decoder_main_input_names = self.decoder_main_engine.get_input_names(self.decoder_main_graph_name)
+        self.decoder_main_output_names = self.decoder_main_engine.get_output_names(self.decoder_main_graph_name)
         self.decoder_main_input_tensors_map = self.decoder_main_engine.create_input_tensors_map(self.decoder_main_graph_name)
         self.decoder_main_output_tensors_map = self.decoder_main_engine.create_output_tensors_map(self.decoder_main_graph_name)
 
         # initial decoder_post engine
         self.decoder_post_engine = sail.Engine(decoder_post_bmodel_path, dev_id, sail.IOMode.SYSIO)
+        self.decoder_post_graph_name = self.decoder_post_engine.get_graph_names()[0]
+        self.decoder_post_input_names = self.decoder_post_engine.get_input_names(self.decoder_post_graph_name)
+        self.decoder_post_output_names = self.decoder_post_engine.get_output_names(self.decoder_post_graph_name)
+        self.decoder_post_input_tensors_map = self.decoder_post_engine.create_input_tensors_map(self.decoder_post_graph_name)
+        self.decoder_post_output_tensors_map = self.decoder_post_engine.create_output_tensors_map(self.decoder_post_graph_name)
 
         # initial decoder_loop engine
         self.decoder_loop_engine = sail.Engine(decoder_loop_bmodel_path, dev_id, sail.IOMode.DEVIO)
         self.decoder_loop_graph_name = self.decoder_loop_engine.get_graph_names()[0]
+        self.decoder_loop_input_names = self.decoder_loop_engine.get_input_names(self.decoder_loop_graph_name)
+        self.decoder_loop_output_names = self.decoder_loop_engine.get_output_names(self.decoder_loop_graph_name)
         self.decoder_loop_input_tensors_map = self.decoder_loop_engine.create_input_tensors_map(self.decoder_loop_graph_name)
         self.decoder_loop_output_tensors_map = self.decoder_loop_engine.create_output_tensors_map(self.decoder_loop_graph_name)
 
@@ -326,27 +350,32 @@ class Whisper(nn.Module):
             # initial kvcache_rearrange engine
             kvcache_rearrange_engine = sail.Engine(kvcache_rearrange_bmodel_path, dev_id, sail.IOMode.DEVIO)
             kvcache_rearrange_graph_name = kvcache_rearrange_engine.get_graph_names()[0]
+            kvcache_rearrange_input_names = kvcache_rearrange_engine.get_input_names(kvcache_rearrange_graph_name)
+            kvcache_rearrange_output_names = kvcache_rearrange_engine.get_output_names(kvcache_rearrange_graph_name)
             kvcache_rearrange_input_tensors_map = kvcache_rearrange_engine.create_input_tensors_map(kvcache_rearrange_graph_name)
             kvcache_rearrange_output_tensors_map = kvcache_rearrange_engine.create_output_tensors_map(kvcache_rearrange_graph_name)
 
-            kvcache_rearrange_input_tensors_map[kvcache_rearrange_engine.get_input_names(kvcache_rearrange_graph_name)[0]] = self.decoder_main_output_tensors_map[self.decoder_main_engine.get_output_names(self.decoder_main_graph_name)[i + 1]]
+            kvcache_rearrange_input_tensors_map[kvcache_rearrange_input_names[0]] = self.decoder_main_output_tensors_map[self.decoder_main_output_names[i + 1]]
 
-            kvcache_rearrange_output_tensors_map[kvcache_rearrange_engine.get_output_names(kvcache_rearrange_graph_name)[0]] = kvcache_rearrange_input_tensors_map[kvcache_rearrange_engine.get_input_names(kvcache_rearrange_graph_name)[0]]
+            kvcache_rearrange_output_tensors_map[kvcache_rearrange_output_names[0]] = kvcache_rearrange_input_tensors_map[kvcache_rearrange_input_names[0]]
 
             self.kvcache_rearrange_engine_list.append(kvcache_rearrange_engine)
             self.kvcache_rearrange_input_dict[kvcache_rearrange_engine] = kvcache_rearrange_input_tensors_map
             self.kvcache_rearrange_output_dict[kvcache_rearrange_engine] = kvcache_rearrange_output_tensors_map
 
         for i in range(self.dims.n_text_layer * 4):
-            self.decoder_loop_input_tensors_map[self.decoder_loop_engine.get_input_names(self.decoder_loop_graph_name)[i + 3]] = self.decoder_main_output_tensors_map[self.decoder_main_engine.get_output_names(self.decoder_main_graph_name)[i + 1]]
+            self.decoder_loop_input_tensors_map[self.decoder_loop_input_names[i + 3]] = self.decoder_main_output_tensors_map[self.decoder_main_output_names[i + 1]]
 
         for i in range(self.dims.n_text_layer * 2):
-            self.decoder_loop_output_tensors_map[self.decoder_loop_engine.get_output_names(self.decoder_loop_graph_name)[i + 1]] = self.decoder_loop_input_tensors_map[self.decoder_loop_engine.get_input_names(self.decoder_loop_graph_name)[i + 3]]
+            self.decoder_loop_output_tensors_map[self.decoder_loop_output_names [i + 1]] = self.decoder_loop_input_tensors_map[self.decoder_loop_input_names[i + 3]]
 
         kvcache_rearrange_engine_base = self.kvcache_rearrange_engine_list[0]
+        kvcache_rearrange_engine_base_input_names = kvcache_rearrange_engine_base.get_input_names(kvcache_rearrange_engine_base.get_graph_names()[0])
 
         for i in range(self.dims.n_text_layer * 2 - 1):
-            self.kvcache_rearrange_input_dict[self.kvcache_rearrange_engine_list[i + 1]][self.kvcache_rearrange_engine_list[i + 1].get_input_names(self.kvcache_rearrange_engine_list[i + 1].get_graph_names()[0])[1]] = self.kvcache_rearrange_input_dict[kvcache_rearrange_engine_base][kvcache_rearrange_engine_base.get_input_names(kvcache_rearrange_engine_base.get_graph_names()[0])[1]]
+            kvcache_rearrange_engine_next = self.kvcache_rearrange_engine_list[i + 1]
+            kvcache_rearrange_engine_next_input_names = kvcache_rearrange_engine_next.get_input_names(kvcache_rearrange_engine_next.get_graph_names()[0])
+            self.kvcache_rearrange_input_dict[kvcache_rearrange_engine_next][kvcache_rearrange_engine_next_input_names[1]] = self.kvcache_rearrange_input_dict[kvcache_rearrange_engine_base][kvcache_rearrange_engine_base_input_names[1]]
 
         self.init_time = time.time() - start_time
         print(f"\nTPU bmodel init time: {self.init_time}s")
@@ -402,18 +431,12 @@ class Whisper(nn.Module):
         tokens = tokens if tokens.flags.c_contiguous else np.ascontiguousarray(tokens)
         audio_features = audio_features if audio_features.flags.c_contiguous else np.ascontiguousarray(audio_features)
 
-        logits_decoder_graph_name = self.logits_decoder_engine.get_graph_names()[0]
-        logits_decoder_input_tensors_map = self.logits_decoder_engine.create_input_tensors_map(logits_decoder_graph_name)
-        logits_decoder_output_tensors_map = self.logits_decoder_engine.create_output_tensors_map(logits_decoder_graph_name)
-
-        logits_decoder_input_tensors_map[self.logits_decoder_engine.get_input_names(logits_decoder_graph_name)[0]].update_data(tokens)
-
+        self.logits_decoder_input_tensors_map[self.logits_decoder_input_names[0]].update_data(tokens)
         unint16_audio_features = fp16_cast(audio_features)
-        logits_decoder_input_tensors_map[self.logits_decoder_engine.get_input_names(logits_decoder_graph_name)[1]].update_data(unint16_audio_features);
+        self.logits_decoder_input_tensors_map[self.logits_decoder_input_names[1]].update_data(unint16_audio_features);
 
-        self.logits_decoder_engine.process(logits_decoder_graph_name,logits_decoder_input_tensors_map,logits_decoder_output_tensors_map)
-        logits_tensor = list(logits_decoder_output_tensors_map.values())[0]
-
+        self.logits_decoder_engine.process(self.logits_decoder_graph_name, self.logits_decoder_input_tensors_map, self.logits_decoder_output_tensors_map)
+        logits_tensor = list(self.logits_decoder_output_tensors_map.values())[0]
         logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
 
         self.time += time.time() - start_time

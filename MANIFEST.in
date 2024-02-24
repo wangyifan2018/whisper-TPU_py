@@ -1,6 +1,0 @@
-include requirements.txt
-include README.md
-include LICENSE
-include bmwhisper/assets/*
-include bmwhisper/normalizers/english.json
-include bmwhisper/third_party/untpu/lib/*

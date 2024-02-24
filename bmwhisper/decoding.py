@@ -72,15 +72,11 @@ def detect_language(
         mel = mel.numpy().astype(np.float16)
         mel = mel if mel.flags.c_contiguous else np.ascontiguousarray(mel)
 
-        encoder_engine_graph_name = model.encoder_engine.get_graph_names()[0]
-        encoder_input_tensors_map = model.encoder_engine.create_input_tensors_map(encoder_engine_graph_name)
-        encoder_output_tensors_map = model.encoder_engine.create_output_tensors_map(encoder_engine_graph_name)
-
         uint16_mel = fp16_cast(mel)
-        encoder_input_tensors_map[model.encoder_engine.get_input_names(encoder_engine_graph_name)[0]].update_data(uint16_mel);
+        model.encoder_input_tensors_map[model.encoder_engine.get_input_names(model.encoder_engine_graph_name)[0]].update_data(uint16_mel);
 
-        model.encoder_engine.process(encoder_engine_graph_name,encoder_input_tensors_map,encoder_output_tensors_map)
-        mel_out_tensor = list(encoder_output_tensors_map.values())[0]
+        model.encoder_engine.process(model.encoder_engine_graph_name,model.encoder_input_tensors_map,model.encoder_output_tensors_map)
+        mel_out_tensor = list(model.encoder_output_tensors_map.values())[0]
         mel_out = torch.from_numpy(mel_out_tensor.asnumpy())
 
         model.time += time.time() - start_time
@@ -711,15 +707,11 @@ class DecodingTask:
             mel = mel if mel.flags.c_contiguous else np.ascontiguousarray(mel)
 
             # sail
-            encoder_engine_graph_name = self.model.encoder_engine.get_graph_names()[0]
-            encoder_input_tensors_map = self.model.encoder_engine.create_input_tensors_map(encoder_engine_graph_name)
-            encoder_output_tensors_map = self.model.encoder_engine.create_output_tensors_map(encoder_engine_graph_name)
-
             uint16_mel = fp16_cast(mel)
-            encoder_input_tensors_map[self.model.encoder_engine.get_input_names(encoder_engine_graph_name)[0]].update_data(uint16_mel);
+            self.model.encoder_input_tensors_map[self.model.encoder_input_names[0]].update_data(uint16_mel);
 
-            self.model.encoder_engine.process(encoder_engine_graph_name,encoder_input_tensors_map,encoder_output_tensors_map)
-            mel_out_tensor = list(encoder_output_tensors_map.values())[0]
+            self.model.encoder_engine.process(self.model.encoder_engine_graph_name, self.model.encoder_input_tensors_map, self.model.encoder_output_tensors_map)
+            mel_out_tensor = list(self.model.encoder_output_tensors_map.values())[0]
 
             audio_features = torch.from_numpy(mel_out_tensor.asnumpy())
             self.model.call_encoder +=1
@@ -786,16 +778,16 @@ class DecodingTask:
                     positional_embedding_input = positional_embedding_input if positional_embedding_input.flags.c_contiguous else np.ascontiguousarray(positional_embedding_input)
                     mask = mask if mask.flags.c_contiguous else np.ascontiguousarray(mask)
 
-                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[0]].update_data(tokens_input)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[0]].update_data(tokens_input)
 
                     uint16_audio_features = fp16_cast(audio_features)
-                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[1]].update_data(uint16_audio_features)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[1]].update_data(uint16_audio_features)
 
                     uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
-                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[2]].update_data(uint16_positional_embedding_input)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[2]].update_data(uint16_positional_embedding_input)
 
                     uint16_mask = fp16_cast(mask)
-                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_engine.get_input_names(self.model.decoder_main_graph_name)[3]].update_data(uint16_mask)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[3]].update_data(uint16_mask)
 
                     self.model.decoder_main_engine.process(self.model.decoder_main_graph_name, self.model.decoder_main_input_tensors_map,self.model.decoder_main_output_tensors_map)
 
@@ -808,19 +800,14 @@ class DecodingTask:
                     x_sot = x[:, padding_num - initial_tokens_length + self.sot_index:padding_num - initial_tokens_length + self.sot_index + 1].copy()
                     x_last = x[:, -1:].copy()
 
-
-                    decoder_post_graph_name = self.model.decoder_post_engine.get_graph_names()[0]
-                    decoder_post_input_tensors_map = self.model.decoder_post_engine.create_input_tensors_map(decoder_post_graph_name)
-                    decoder_post_output_tensors_map = self.model.decoder_post_engine.create_output_tensors_map(decoder_post_graph_name)
-
                     uint16_x_sot = fp16_cast(x_sot)
-                    decoder_post_input_tensors_map[self.model.decoder_post_engine.get_input_names(decoder_post_graph_name)[0]].update_data(uint16_x_sot);
+                    self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[0]].update_data(uint16_x_sot);
                     uint16_x_last = fp16_cast(x_last)
-                    decoder_post_input_tensors_map[self.model.decoder_post_engine.get_input_names(decoder_post_graph_name)[1]].update_data(uint16_x_last);
+                    self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[1]].update_data(uint16_x_last);
 
-                    self.model.decoder_post_engine.process(decoder_post_graph_name,decoder_post_input_tensors_map,decoder_post_output_tensors_map)
-                    logits_tensor = decoder_post_output_tensors_map[self.model.decoder_post_engine.get_output_names(decoder_post_graph_name)[0]]
-                    no_speech_probs_tensor = decoder_post_output_tensors_map[self.model.decoder_post_engine.get_output_names(decoder_post_graph_name)[1]]
+                    self.model.decoder_post_engine.process(self.model.decoder_post_graph_name, self.model.decoder_post_input_tensors_map, self.model.decoder_post_output_tensors_map)
+                    logits_tensor = self.model.decoder_post_output_tensors_map[self.model.decoder_post_output_names[0]]
+                    no_speech_probs_tensor = self.model.decoder_post_output_tensors_map[self.model.decoder_post_output_names[1]]
 
                     logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
                     no_speech_probs = uint16_to_fp16(no_speech_probs_tensor.asnumpy()).tolist()
@@ -840,22 +827,18 @@ class DecodingTask:
                     mask = mask if mask.flags.contiguous else np.ascontiguousarray(mask)
 
                     # sail
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[0]].update_data(tokens_input)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[0]].sync_s2d()
-
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[0]].update_data(tokens_input)
                     uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[1]].update_data(uint16_positional_embedding_input)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[1]].sync_s2d()
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[1]].update_data(uint16_positional_embedding_input)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[1]]
 
                     uint16_mask = fp16_cast(mask)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[2]].update_data(uint16_mask)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_engine.get_input_names(self.model.decoder_loop_graph_name)[2]].sync_s2d()
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[2]].update_data(uint16_mask)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[2]]
 
                     self.model.decoder_loop_engine.process(self.model.decoder_loop_graph_name, self.model.decoder_loop_input_tensors_map, self.model.decoder_loop_output_tensors_map)
 
-
-                    logits_tensor = self.model.decoder_loop_output_tensors_map[self.model.decoder_loop_engine.get_output_names(self.model.decoder_loop_graph_name)[0]]
-
+                    logits_tensor = self.model.decoder_loop_output_tensors_map[self.model.decoder_loop_output_names[0]]
                     logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
 
                     self.model.call_decoder_loop += 1
