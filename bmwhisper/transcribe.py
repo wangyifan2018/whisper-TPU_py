@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import tqdm
 import time
+import gc
 
 from .audio import (
     FRAMES_PER_SECOND,
@@ -15,6 +16,7 @@ from .audio import (
     N_SAMPLES,
     SAMPLE_RATE,
     log_mel_spectrogram,
+    log_mel_spectrogram_np,
     pad_or_trim,
 )
 from .decoding import DecodingOptions, DecodingResult
@@ -112,6 +114,9 @@ def transcribe(
 
     # Pad 30-seconds of silence to the input audio, for slicing
     mel = log_mel_spectrogram(audio, padding=N_SAMPLES) # a torch only part beacause of torch.hann_window, torch.stft etc.
+    # mel_np = log_mel_spectrogram_np(audio, padding=N_SAMPLES)
+    # print(mel_np)
+    # mel = torch.from_numpy(mel_np)
     content_frames = mel.shape[-1] - N_FRAMES
 
     if decode_options.get("language", None) is None:
@@ -442,7 +447,7 @@ def cli():
 
     from . import load_model
 
-    model = load_model(args) 
+    model = load_model(args)
     pop_list = ["model_name", "model_dir", "bmodel_dir", "chip_mode"]
     for arg in pop_list:
         args.pop(arg)
@@ -469,10 +474,62 @@ def cli():
         if loop_profile:
             model.print_cnt()
         print()
+
+
         print(f"Total tpu inference time: {model.time}s")
         print(f"Total cpu inference time: {cpu_time}s")
         print(f"Total time: {cpu_time + model.time}s")
         model.time = 0
+
+    # model.kvcache_rearrange_engine_list.clear()
+    # time.sleep(1)
+
+    # del model.encoder_input_tensors_map
+    # del model.encoder_output_tensors_map
+
+    # del model.logits_decoder_input_tensors_map
+    # del model.logits_decoder_output_tensors_map
+
+
+    # del model.decoder_main_input_tensors_map
+    # del model.decoder_main_output_tensors_map
+
+    # del model.decoder_post_input_tensors_map
+    # del model.decoder_post_output_tensors_map
+
+    # del model.decoder_loop_input_tensors_map
+    # del model.decoder_loop_output_tensors_map
+
+
+    # del model.encoder_engine
+    # del model.logits_decoder_engine
+    # del model.decoder_main_engine
+    # del model.decoder_post_engine
+    # del model.decoder_loop_engine
+
+    # list_len = len(model.kvcache_rearrange_engine_list)
+    # print(list_len)
+    # cnt = 0
+    # for i in range(0, list_len):
+    #     cnt += 1
+    #     print(cnt)
+    #     del model.kvcache_rearrange_engine_list[0]
+
+    # del model.kvcache_rearrange_input_dict
+    # del model.kvcache_rearrange_output_dict
+
+
+
+
+    # time.sleep(1)
+
+        # del model.kvcache_rearrange_engine_list
+        # model.kvcache_rearrange_engine_list.clear()
+    # time.sleep(1)
+
+    # gc.collect()
+
+
     print("{:-^100}".format(f"  Total time: {time.time() - start_time} seconds "))
 
 if __name__ == "__main__":

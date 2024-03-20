@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import librosa
 from .utils import exact_div
 
 # hard-coded audio hyperparameters
@@ -154,4 +155,57 @@ def log_mel_spectrogram(
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
+    return log_spec
+
+
+def log_mel_spectrogram_np(audio, n_mels=N_MELS, padding=0):
+    """
+    Compute the log-Mel spectrogram of an audio signal.
+
+    Parameters
+    ----------
+    audio: Union[str, np.ndarray], shape = (*)
+        The path to audio or a NumPy array containing the audio waveform in 16 kHz
+
+    n_mels: int
+        The number of Mel-frequency filters
+
+    padding: int
+        Number of zero samples to pad to the right
+
+    sr: int
+        Sample rate of the audio signal
+
+    Returns
+    -------
+    np.ndarray, shape = (n_mels, n_frames)
+        An array that contains the Mel spectrogram
+    """
+    if isinstance(audio, str):
+        audio = load_audio(audio)
+
+    if padding > 0:
+        audio = np.pad(audio, (0, padding), mode='constant')
+
+    # Compute the STFT
+    stft = librosa.stft(audio, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann', center=True)
+    magnitudes = np.abs(stft) ** 2
+
+    # Create Mel filterbank
+    mel_basis = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=n_mels)
+
+    # Apply the Mel filterbank
+    mel_spec = np.dot(mel_basis, magnitudes)
+
+    # filters = mel_filters_np(n_mels)
+    # mel_spec = filters @ magnitudes
+
+    # Compute log Mel spectrogram
+    log_spec = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
+
+    # Normalize log Mel spectrogram
+    log_spec = np.maximum(log_spec, np.max(log_spec) - 80.0)  # Assuming 80 dB dynamic range
+    log_spec = (log_spec + 40.0) / 40.0  # Assuming max dB is 40
+    # print("log_spec: ", log_spec, log_spec.shape)
+
     return log_spec

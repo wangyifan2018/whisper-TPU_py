@@ -195,10 +195,11 @@ class PyTorchInference(Inference):
             start_time = time.time()
             indices = np.array(source_indices, dtype=np.int32)
             indices = indices if indices.flags.contiguous else indices.copy()
-            self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[0]][self.model.kvcache_rearrange_engine_list[0].get_input_names(self.model.kvcache_rearrange_engine_list[0].get_graph_names()[0])[1]].update_data(indices)
+            # self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[0]][self.model.kvcache_rearrange_engine_list[0].get_input_names(self.model.kvcache_rearrange_engine_list[0].get_graph_names()[0])[1]].update_data(indices)
+            # self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[0]][self.model.kvcache_rearrange_engine_list[0].get_input_names(self.model.kvcache_rearrange_engine_list[0].get_graph_names()[0])[1]].sync_s2d()
 
-            for i in range(2 * self.model.dims.n_text_layer):
-                self.model.kvcache_rearrange_engine_list[i].process(self.model.kvcache_rearrange_engine_list[i].get_graph_names()[0], self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[i]], self.model.kvcache_rearrange_output_dict[self.model.kvcache_rearrange_engine_list[i]])
+            # for i in range(2 * self.model.dims.n_text_layer):
+            #     self.model.kvcache_rearrange_engine_list[i].process(self.model.kvcache_rearrange_engine_list[i].get_graph_names()[0], self.model.kvcache_rearrange_input_dict[self.model.kvcache_rearrange_engine_list[i]], self.model.kvcache_rearrange_output_dict[self.model.kvcache_rearrange_engine_list[i]])
 
             self.model.time += time.time() - start_time
             self.model.call_kvcache_rearrange += 2 * self.model.dims.n_text_layer
@@ -779,15 +780,19 @@ class DecodingTask:
                     mask = mask if mask.flags.c_contiguous else np.ascontiguousarray(mask)
 
                     self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[0]].update_data(tokens_input)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[0]].sync_s2d()
 
                     uint16_audio_features = fp16_cast(audio_features)
                     self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[1]].update_data(uint16_audio_features)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[1]].sync_s2d()
 
                     uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
                     self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[2]].update_data(uint16_positional_embedding_input)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[2]].sync_s2d()
 
                     uint16_mask = fp16_cast(mask)
                     self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[3]].update_data(uint16_mask)
+                    self.model.decoder_main_input_tensors_map[self.model.decoder_main_input_names[3]].sync_s2d()
 
                     self.model.decoder_main_engine.process(self.model.decoder_main_graph_name, self.model.decoder_main_input_tensors_map,self.model.decoder_main_output_tensors_map)
 
@@ -802,8 +807,10 @@ class DecodingTask:
 
                     uint16_x_sot = fp16_cast(x_sot)
                     self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[0]].update_data(uint16_x_sot);
+                    self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[0]].sync_s2d()
                     uint16_x_last = fp16_cast(x_last)
                     self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[1]].update_data(uint16_x_last);
+                    self.model.decoder_post_input_tensors_map[self.model.decoder_post_input_names[1]].sync_s2d()
 
                     self.model.decoder_post_engine.process(self.model.decoder_post_graph_name, self.model.decoder_post_input_tensors_map, self.model.decoder_post_output_tensors_map)
                     logits_tensor = self.model.decoder_post_output_tensors_map[self.model.decoder_post_output_names[0]]
@@ -828,13 +835,14 @@ class DecodingTask:
 
                     # sail
                     self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[0]].update_data(tokens_input)
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[0]].sync_s2d()
                     uint16_positional_embedding_input = fp16_cast(positional_embedding_input)
                     self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[1]].update_data(uint16_positional_embedding_input)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[1]]
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[1]].sync_s2d()
 
                     uint16_mask = fp16_cast(mask)
                     self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[2]].update_data(uint16_mask)
-                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[2]]
+                    self.model.decoder_loop_input_tensors_map[self.model.decoder_loop_input_names[2]].sync_s2d()
 
                     self.model.decoder_loop_engine.process(self.model.decoder_loop_graph_name, self.model.decoder_loop_input_tensors_map, self.model.decoder_loop_output_tensors_map)
 
