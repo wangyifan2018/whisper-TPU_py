@@ -3,7 +3,6 @@ import os
 import warnings
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 import numpy as np
-import torch
 import tqdm
 import time
 
@@ -13,7 +12,7 @@ from .utils import (
     N_FRAMES,
     N_SAMPLES,
     SAMPLE_RATE,
-    log_mel_spectrogram,
+    log_mel_spectrogram_np,
     pad_or_trim,
 )
 from .decoding import DecodingOptions, DecodingResult
@@ -26,7 +25,6 @@ from .utils import (
     optional_float,
     optional_int,
     str2bool,
-    add_word_timestamps
 )
 
 if TYPE_CHECKING:
@@ -35,7 +33,7 @@ if TYPE_CHECKING:
 
 def transcribe(
     model: "Whisper",
-    audio: Union[str, np.ndarray, torch.Tensor],
+    audio: Union[str, np.ndarray],
     *,
     verbose: Optional[bool] = None,
     temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
@@ -57,7 +55,7 @@ def transcribe(
     model: Whisper
         The Whisper model instance
 
-    audio: Union[str, np.ndarray, torch.Tensor]
+    audio: Union[str, np.ndarray]
         The path to the audio file to open, or the audio waveform
 
     verbose: bool
@@ -107,10 +105,10 @@ def transcribe(
     the spoken language ("language"), which is detected when `decode_options["language"]` is None.
     """
     # only float16 now
-    dtype = torch.float16
+    dtype = np.float16
+    # # Pad 30-seconds of silence to the input audio, for slicing
 
-    # Pad 30-seconds of silence to the input audio, for slicing
-    mel = log_mel_spectrogram(audio, model.dims.n_mels, padding=N_SAMPLES)
+    mel =  log_mel_spectrogram_np(audio, model.dims.n_mels, padding=N_SAMPLES)
 
     content_frames = mel.shape[-1] - N_FRAMES
 
@@ -122,7 +120,7 @@ def transcribe(
                 print(
                     "Detecting language using up to the first 30 seconds. Use `--language` to specify the language"
                 )
-            mel_segment = pad_or_trim(mel, N_FRAMES).to(dtype)
+            mel_segment = pad_or_trim(mel, N_FRAMES).astype(dtype)
             _, probs = model.detect_language(mel_segment)
             decode_options["language"] = max(probs, key=probs.get)
             if verbose is not None:
@@ -141,7 +139,7 @@ def transcribe(
     if word_timestamps and task == "translate":
         warnings.warn("Word-level timestamps on translations may not be reliable.")
 
-    def decode_with_fallback(segment: torch.Tensor) -> DecodingResult:
+    def decode_with_fallback(segment: np.ndarray) -> DecodingResult:
         temperatures = (
             [temperature] if isinstance(temperature, (int, float)) else temperature
         )
@@ -160,8 +158,8 @@ def transcribe(
             # print(f"kwargs: {kwargs}")
 
             options = DecodingOptions(**kwargs, temperature=t)
-            decode_result = model.decode(segment, options)
 
+            decode_result = model.decode(segment, options)
             needs_fallback = False
             if (
                 compression_ratio_threshold is not None
@@ -201,7 +199,7 @@ def transcribe(
         initial_prompt_tokens = []
 
     def new_segment(
-        *, start: float, end: float, tokens: torch.Tensor, result: DecodingResult
+        *, start: float, end: float, tokens: np.ndarray, result: DecodingResult
     ):
         tokens = tokens.tolist()
         text_tokens = [token for token in tokens if token < tokenizer.eot]
@@ -227,11 +225,12 @@ def transcribe(
             mel_segment = mel[:, seek : seek + N_FRAMES]
             segment_size = min(N_FRAMES, content_frames - seek)
             segment_duration = segment_size * HOP_LENGTH / SAMPLE_RATE
-            mel_segment = pad_or_trim(mel_segment, N_FRAMES).to(dtype)
+            mel_segment = pad_or_trim(mel_segment, N_FRAMES).astype(dtype)
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
+
             result: DecodingResult = decode_with_fallback(mel_segment)
-            tokens = torch.tensor(result.tokens)
+            tokens = np.array(result.tokens)
             # print(f"result: {result}")
 
             if no_speech_threshold is not None:
@@ -251,11 +250,11 @@ def transcribe(
             previous_seek = seek
             current_segments = []
 
-            timestamp_tokens: torch.Tensor = tokens.ge(tokenizer.timestamp_begin)
+            timestamp_tokens = tokens >= tokenizer.timestamp_begin
             single_timestamp_ending = timestamp_tokens[-2:].tolist() == [False, True]
 
-            consecutive = torch.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0]
-            consecutive.add_(1)
+            consecutive = np.where(timestamp_tokens[:-1] & timestamp_tokens[1:])[0]
+            consecutive += 1
             if len(consecutive) > 0:
                 # if the output contains two consecutive timestamp tokens
                 slices = consecutive.tolist()
@@ -292,7 +291,7 @@ def transcribe(
                     seek += last_timestamp_pos * input_stride
             else:
                 duration = segment_duration
-                timestamps = tokens[timestamp_tokens.nonzero().flatten()]
+                timestamps = tokens[timestamp_tokens]
                 if (
                     len(timestamps) > 0
                     and timestamps[-1].item() != tokenizer.timestamp_begin
@@ -312,30 +311,6 @@ def transcribe(
                     )
                 )
                 seek += segment_size
-
-            if word_timestamps:
-                add_word_timestamps(
-                    segments=current_segments,
-                    model=model,
-                    tokenizer=tokenizer,
-                    mel=mel_segment,
-                    num_frames=segment_size,
-                    prepend_punctuations=prepend_punctuations,
-                    append_punctuations=append_punctuations,
-                    last_speech_timestamp=last_speech_timestamp,
-                )
-                word_end_timestamps = [
-                    w["end"] for s in current_segments for w in s["words"]
-                ]
-                if len(word_end_timestamps) > 0:
-                    last_speech_timestamp = word_end_timestamps[-1]
-                if not single_timestamp_ending and len(word_end_timestamps) > 0:
-                    seek_shift = round(
-                        (word_end_timestamps[-1] - time_offset) * FRAMES_PER_SECOND
-                    )
-                    if seek_shift > 0:
-                        seek = previous_seek + seek_shift
-
             if verbose:
                 for segment in current_segments:
                     start, end, text = segment["start"], segment["end"], segment["text"]
@@ -413,7 +388,6 @@ def cli():
     parser.add_argument("--highlight_words", type=str2bool, default=False, help="(requires --word_timestamps True) underline each word as it is spoken in srt and vtt")
     parser.add_argument("--max_line_width", type=optional_int, default=None, help="(requires --word_timestamps True) the maximum number of characters in a line before breaking the line")
     parser.add_argument("--max_line_count", type=optional_int, default=None, help="(requires --word_timestamps True) the maximum number of lines in a segment")
-    parser.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
     parser.add_argument("--padding_size", type=optional_int, default=448, help="max pre-allocation size for the key-value cache")
     parser.add_argument("--loop_profile", action="store_true", help="whether to print loop times")
     # fmt: on
@@ -439,9 +413,6 @@ def cli():
     else:
         temperature = [temperature]
 
-    if (threads := args.pop("threads")) > 0:
-        torch.set_num_threads(threads)
-
     from . import load_model
 
     model = load_model(args)
@@ -458,7 +429,6 @@ def cli():
     if args["max_line_count"] and not args["max_line_width"]:
         warnings.warn("--max_line_count has no effect without --max_line_width")
     writer_args = {arg: args.pop(arg) for arg in word_options}
-
     for audio_path in args.pop("audio"):
         model.init_cnt()
         print()

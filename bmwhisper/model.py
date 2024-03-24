@@ -3,9 +3,9 @@ import time
 import base64
 import gzip
 from dataclasses import dataclass
-import sophon.sail as sail
 import numpy as np
-import torch
+from scipy.sparse import csr_matrix
+import sophon.sail as sail
 
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
@@ -45,17 +45,16 @@ class Whisper():
         self.dev_id = args["dev_id"]
 
         # use the last half layers for alignment by default; see `set_alignment_heads()` below
-        all_heads = torch.zeros(
-            self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
-        )
+        all_heads = np.zeros((self.dims.n_text_layer, self.dims.n_text_head), dtype=bool)
+
         all_heads[self.dims.n_text_layer // 2 :] = True
-        self.alignment_heads = all_heads.to_sparse()
+        all_heads_sparse = csr_matrix(all_heads)
+
 
         # get positional embedding from npz file
         positional_embedding_path = os.path.join(os.path.dirname(__file__), "assets", f"positional_embedding_{self.model_name}.npz")
         assert os.path.exists(positional_embedding_path), f"{positional_embedding_path} not found"
-        self.positional_embedding = torch.tensor(np.load(positional_embedding_path)["positional_embedding"])
-
+        self.positional_embedding = np.load(positional_embedding_path)["positional_embedding"]
         ########################################
         ## Using sail to load BModel
         ########################################
@@ -153,18 +152,19 @@ class Whisper():
         array = np.frombuffer(
             gzip.decompress(base64.b85decode(dump)), dtype=bool
         ).copy()
-        mask = torch.from_numpy(array).reshape(
+        mask = array.reshape(
             self.dims.n_text_layer, self.dims.n_text_head
         )
-        self.alignment_heads = mask.to_sparse()
 
-    def embed_audio(self, mel: torch.Tensor):
+        self.alignment_heads = csr_matrix(mask)
+
+    def embed_audio(self, mel: np.ndarray):
         return self.encoder(mel)
 
-    def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
+    def logits(self, tokens: np.ndarray, audio_features: np.ndarray):
         # hard code tokens type here
-        tokens = tokens.numpy().astype(np.int32)
-        audio_features = audio_features.numpy().astype(np.float16)
+        tokens = tokens.astype(np.int32)
+        audio_features = audio_features.astype(np.float16)
         tokens = tokens if tokens.flags.c_contiguous else np.ascontiguousarray(tokens)
         audio_features = audio_features if audio_features.flags.c_contiguous else np.ascontiguousarray(audio_features)
 
@@ -174,7 +174,7 @@ class Whisper():
 
         self.combined_whisper_engine.process(self.logits_decoder_graph_name, self.logits_decoder_input_tensors_map, self.logits_decoder_output_tensors_map)
         logits_tensor = list(self.logits_decoder_output_tensors_map.values())[0]
-        logits = torch.from_numpy(uint16_to_fp16(logits_tensor.asnumpy()))
+        logits = uint16_to_fp16(logits_tensor.asnumpy())
 
         self.call_logits_decoder += 1
         return logits
