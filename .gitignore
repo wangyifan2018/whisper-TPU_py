@@ -5,8 +5,10 @@ __pycache__/
 .pytest_cache
 .ipynb_checkpoints
 *.bmodel
+models/
 onnx_model/
 dist/
+datasets/
 *.npy
 *.npz
 *.onnx

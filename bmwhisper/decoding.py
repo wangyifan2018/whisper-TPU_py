@@ -136,8 +136,28 @@ class DecodingResult:
     temperature: float = np.nan
     compression_ratio: float = np.nan
 
+class Inference:
+    def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
+        """Perform a forward pass on the decoder and return per-token logits"""
+        raise NotImplementedError
 
-class PyTorchInference():
+    def rearrange_kv_cache(
+            self,
+            source_indices,
+            self_attention_kcache: Tensor,
+            self_attention_vcache: Tensor,
+            cross_attention_kcache: Tensor,
+            cross_attention_vcache: Tensor
+        ) -> None:
+        """Update the key-value cache according to the updated beams"""
+        raise NotImplementedError
+
+    def cleanup_caching(self) -> None:
+        """Clean up any resources or hooks after decoding is finished"""
+        pass
+
+
+class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
 
@@ -195,7 +215,65 @@ class MaximumLikelihoodRanker(SequenceRanker):
         return [np.argmax(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
 
 
-class GreedyDecoder():
+class TokenDecoder:
+    def reset(self):
+        """Initialize any stateful variables for decoding a new sequence"""
+
+    def update(
+        self,
+        tokens: Tensor,
+        logits: Tensor,
+        sum_logprobs: Tensor,
+    ) -> Tuple[Tensor, bool]:
+        """Specify how to select the next token, based on the current trace and logits
+
+        Parameters
+        ----------
+        tokens : Tensor, shape = (n_batch, current_sequence_length)
+            all tokens in the context so far, including the prefix and sot_sequence tokens
+
+        logits : Tensor, shape = (n_batch, vocab_size)
+            per-token logits of the probability distribution at the current step
+
+        sum_logprobs : Tensor, shape = (n_batch)
+            cumulative log probabilities for each sequence
+
+        Returns
+        -------
+        tokens : Tensor, shape = (n_batch, current_sequence_length + 1)
+            the tokens, appended with the selected next token
+
+        completed : bool
+            True if all sequences has reached the end of text
+
+        """
+        raise NotImplementedError
+
+    def finalize(
+        self, tokens: Tensor, sum_logprobs: Tensor
+    ) -> Tuple[Sequence[Sequence[Tensor]], List[List[float]]]:
+        """Finalize search and return the final candidate sequences
+
+        Parameters
+        ----------
+        tokens : Tensor, shape = (n_audio, n_group, current_sequence_length)
+            all tokens in the context so far, including the prefix and sot_sequence
+
+        sum_logprobs : Tensor, shape = (n_audio, n_group)
+            cumulative log probabilities for each sequence
+
+        Returns
+        -------
+        tokens : Sequence[Sequence[Tensor]], length = n_audio
+            sequence of Tensors containing candidate token sequences, for each audio input
+
+        sum_logprobs : List[List[float]], length = n_audio
+            sequence of cumulative log probabilities corresponding to the above
+
+        """
+        raise NotImplementedError
+
+class GreedyDecoder(TokenDecoder):
     def __init__(self, temperature: float, eot: int):
         self.temperature = temperature
         self.eot = eot
@@ -246,7 +324,7 @@ class GreedyDecoder():
         return tokens, sum_logprobs.tolist()
 
 
-class BeamSearchDecoder():
+class BeamSearchDecoder(TokenDecoder):
     def __init__(
         self,
         beam_size: int,
@@ -488,6 +566,7 @@ class ApplyTimestampRules(LogitFilter):
 
 class DecodingTask:
     sequence_ranker: SequenceRanker
+    decoder: TokenDecoder
     logit_filters: List[LogitFilter]
 
     def __init__(self, model: "Whisper", options: DecodingOptions):
