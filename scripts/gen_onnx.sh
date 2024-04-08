@@ -4,7 +4,7 @@
 model="base"
 beam_size=5
 padding_size=448
-use_kvcache=false
+use_kvcache=true
 
 
 work_dir="tmp"

@@ -163,6 +163,8 @@ for process_name in "${process_list[@]}"; do
     rm -rf $bmodel_file
     popd
 done
-
 popd
-chown -R 1000:1000 .
+chmod -R 777 $bmodel_dir/
+cd $bmodel_dir/
+model_tool --combine all_quant_encoder_${model}_5beam_448pad_1684x_f16.bmodel all_quant_logits_decoder_${model}_5beam_448pad_1684x_f16.bmodel all_quant_decoder_main_with_kvcache_${model}_5beam_448pad_1684x_f16.bmodel all_quant_decoder_post_${model}_5beam_448pad_1684x_f16.bmodel all_quant_decoder_loop_with_kvcache_${model}_5beam_448pad_1684x_f16.bmodel all_quant_kvcache_rearrange_${model}_5beam_448pad_1684x_f16.bmodel -o bmwhisper_${model}_1684x_f16.bmodel
+chown 1000:1000 bmwhisper_${model}_1684x_f16.bmodel

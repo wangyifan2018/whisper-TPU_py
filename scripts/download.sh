@@ -25,11 +25,26 @@ fi
 # models
 if [ ! -d "../models" ]; 
 then
-    python3 -m dfss --url=open@sophgo.com:sophon-demo/Whisper/model_240327/models.zip
-    unzip models.zip -d ../
-    rm models.zip
-    echo "models download!"
+    mkdir ../models
+    python3 -m dfss --url=open@sophgo.com:sophon-demo/Whisper/model_240408/bmodel.zip
+    unzip bmodel.zip -d ../models
+    rm bmodel.zip
+    echo "bmodel download!"
+    python3 -m dfss --url=open@sophgo.com:sophon-demo/Whisper/model_240408/onnx.zip
+    unzip onnx.zip -d ../models
+    rm onnx.zip
+    echo "onnx models download!"
 else
     echo "Models folder exist! Remove it if you need to update."
+fi
+# assets
+if [ ! -d "../python/bmwhisper/assets" ]; 
+then
+    python3 -m dfss --url=open@sophgo.com:sophon-demo/Whisper/model_240408/assets.zip
+    unzip assets.zip -d ../python/bmwhisper
+    rm assets.zip
+    echo "assets download!"
+else
+    echo "Assets folder exist! Remove it if you need to update."
 fi
 popd

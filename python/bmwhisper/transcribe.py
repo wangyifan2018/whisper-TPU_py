@@ -1,3 +1,11 @@
+#===----------------------------------------------------------------------===#
+#
+# Copyright (C) 2024 Sophgo Technologies Inc.  All rights reserved.
+#
+# SOPHON-DEMO is licensed under the 2-Clause BSD License except for the
+# third-party components.
+#
+#===----------------------------------------------------------------------===#
 import argparse
 import os
 import warnings
@@ -387,7 +395,7 @@ def cli():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("audio", nargs="+", type=str, help="audio file(s) to transcribe")
     parser.add_argument("--model", default="small", choices=available_models(), help="name of the Whisper model to use")
-    parser.add_argument("--bmodel_dir", type=str, default="../models/BM1684X/", help="the path to save model files; uses ./bmodel by default")
+    parser.add_argument("--bmodel_dir", type=str, default="../models/BM1684X/", help="the path of bmodels; uses ../models/BM1684X/ by default")
 
     parser.add_argument('--dev_id', type=int, default=0, help='dev id for sophgo tpu')
 

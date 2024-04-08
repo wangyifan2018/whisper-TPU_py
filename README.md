@@ -76,97 +76,7 @@ chmod -R +x scripts/
     └── demo.wav
 ```
 ## 4. 模型编译
-
-可以直接下载我们已经导出的onnx模型，推荐在mlir部分提供的docker中完成转bmodel模型。
-**注意**：
-- 编译模型需要在x86主机完成。
-
-### 4.1 TPU-MLIR环境搭建
-模型编译前需要安装TPU-MLIR。安装好后需在TPU-MLIR环境中进入例程目录。先导出onnx，然后使用TPU-MLIR将onnx模型编译为BModel。编译的具体方法可参考《TPU-MLIR快速入门手册》的“3. 编译ONNX模型”(请从算能官网相应版本的SDK中获取)。
-
-#### 4.1.1 安装docker
-若已安装docker，请跳过本节。
-```bash
-# 安装docker
-sudo apt-get install docker.io
-# docker命令免root权限执行
-# 创建docker用户组，若已有docker组会报错，没关系可忽略
-sudo groupadd docker
-# 将当前用户加入docker组
-sudo usermod -aG docker $USER
-# 切换当前会话到新group或重新登录重启X会话
-newgrp docker​
-```
-> **提示**：需要logout系统然后重新登录，再使用docker就不需要sudo了。
-
-#### 4.1.2 下载并解压TPU-MLIR
-从sftp上获取TPU-MLIR压缩包
-```bash
-pip3 install dfss --upgrade
-python3 -m dfss --url=open@sophgo.com:sophon-demo/Whisper/mlir/tpu-mlir_v1.6.135-g12c3f90d8-20240327.tar.gz
-```
-
-#### 4.1.3 创建并进入docker
-TPU-MLIR使用的docker是sophgo/tpuc_dev:latest, docker镜像和tpu-mlir有绑定关系，少数情况下有可能更新了tpu-mlir，需要新的镜像。
-```bash
-docker pull sophgo/tpuc_dev:latest
-# 这里将本级目录映射到docker内的/workspace目录,用户需要根据实际情况将demo的目录映射到docker里面
-# myname只是举个名字的例子, 请指定成自己想要的容器的名字
-docker run --name myname -v $PWD:/workspace -it sophgo/tpuc_dev:latest
-# 此时已经进入docker，并在/workspace目录下
-# 初始化软件环境
-cd /workspace/tpu-mlir_vx.y.z-<hash>-<date>
-source ./envsetup.sh
-```
-此镜像仅onnx模型导出和编译量化模型，程序编译和运行请在开发和运行环境中进行。更多TPU-MLIR的教程请参考算能官网的《TPU-MLIR快速入门手册》和《TPU-MLIR开发参考手册》。
-
-
-### 4.2 获取onnx
-使用download.sh脚本下载的模型包括 whisper base/small/medium 的onnx模型：
-```
-./models
-    └── onnx
-      ├── decoder_loop_with_kvcache_base_5beam_448pad.onnx
-      ├── decoder_loop_with_kvcache_medium_5beam_448pad.onnx
-      ├── decoder_loop_with_kvcache_small_5beam_448pad.onnx
-      ├── decoder_main_with_kvcache_base_5beam_448pad.onnx
-      ├── decoder_main_with_kvcache_medium_5beam_448pad.onnx
-      ├── decoder_main_with_kvcache_small_5beam_448pad.onnx
-      ├── decoder_post_base_5beam_448pad.onnx
-      ├── decoder_post_medium_5beam_448pad.onnx
-      ├── decoder_post_small_5beam_448pad.onnx
-      ├── encoder_base_5beam_448pad.onnx
-      ├── encoder_medium_5beam_448pad.onnx
-      ├── encoder_small_5beam_448pad.onnx
-      ├── kvcache_rearrange_base_5beam_448pad.onnx
-      ├── kvcache_rearrange_medium_5beam_448pad.onnx
-      ├── kvcache_rearrange_small_5beam_448pad.onnx
-      ├── logits_decoder_base_5beam_448pad.onnx
-      ├── logits_decoder_medium_5beam_448pad.onnx
-      └── logits_decoder_small_5beam_448pad.onnx
-```
-
-或者从源码导出
-```bash
-./scripts/gen_onnx.sh --model base
-```
-
-### 4.3 bmodel编译
-目前TPU-MLIR支持1684x对Whisper进行F16量化，使用如下命令生成bmodel。
-```bash
-./scripts/gen_bmodel.sh --model base
-```
-其中，model可以指定base/small/medium，编译成功之后共有6个模型放置于`./models/1684X/'，需要将多个模型combine。
-
-在装有驱动的docker/盒子/PCIE主机环境执行以下命令，以base为例
-```bash
-sudo chmod -R 777 ./models/1684X/
-cd ./models/1684X/
-tpu_model --combine all_quant_encoder_base_5beam_448pad_1684x_f16.bmodel all_quant_logits_decoder_base_5beam_448pad_1684x_f16.bmodel all_quant_decoder_main_with_kvcache_base_5beam_448pad_1684x_f16.bmodel all_quant_decoder_post_base_5beam_448pad_1684x_f16.bmodel all_quant_decoder_loop_with_kvcache_base_5beam_448pad_1684x_f16.bmodel all_quant_kvcache_rearrange_base_5beam_448pad_1684x_f16.bmodel -o bmwhisper_base_1684x_f16.bmodel
-```
-
-最终会生成模型`bmwhisper_base_1684x_f16.bmodel`
-
+此部分请参考[Whisper模型的导出与编译](./docs/ChatGLM3_Export_Guide.md)
 
 ## 5. 例程测试
 
@@ -186,28 +96,23 @@ cat online_wer | grep "Overall"
 在aishell数据集上，精度测试结果如下：
 |   测试平台    |    测试程序   |              测试模型                                 | WER    |
 | ------------ | ------------ | ----------------------------------------------------- | ------ |
-| BM1684X Pcie | whisper.py   | bmwhisper_base_1684x_f16.bmodel                       | 17.80% |
-| BM1684X Pcie | whisper.py   | bmwhisper_small_1684x_f16.bmodel                      | 9.44%  |
-| BM1684X Pcie | whisper.py   | bmwhisper_medium_1684x_f16.bmodel                     | 5.88%  |
-| BM1684X SoC  | whisper.py   | bmwhisper_base_1684x_f16.bmodel                       | 17.80% |
-| BM1684X SoC  | whisper.py   | bmwhisper_small_1684x_f16.bmodel                      | 9.44%  |
-| BM1684X SoC  | whisper.py   | bmwhisper_medium_1684x_f16.bmodel                     | 5.88%  |
+|   SE7-32     | whisper.py   | bmwhisper_base_1684x_f16.bmodel                       | 17.80% |
+|   SE7-32     | whisper.py   | bmwhisper_small_1684x_f16.bmodel                      | 9.44%  |
+|   SE7-32     | whisper.py   | bmwhisper_medium_1684x_f16.bmodel                     | 5.88%  |
 
 > **测试说明**：
 1. 在使用的模型相同的情况下，wer在不同的测试平台上是相同的。
 2. 由于SDK版本之间的差异，实测的wer与本表有1%以内的差值是正常的。
 
 ## 7. 性能测试
-|    测试平台   |     测试程序      |           测试模型                  |  Preprocess time(ms) |    Inference time(ms)   |    Total time(ms)    |
-| -----------  | ---------------- | -----------------------------------| --------------------- | ----------------------- |----------------------|
-| BM1684X Pcie | whisper.py       | bmwhisper_base_1684x_f16.bmodel    | 36.56                 | 56.88                   | 93.44                |
-| BM1684X Pcie | whisper.py       | bmwhisper_small_1684x_f16.bmodel   | 73.31                 | 171.38                  | 244.69               |
-| BM1684X Pcie | whisper.py       | bmwhisper_medium_1684x_f16.bmodel  | 81.80                 | 439.11                  | 520.91               |
-| BM1684X SoC  | whisper.py       | bmwhisper_base_1684x_f16.bmodel    | 247.61                | 61.70                   | 309.31               |
-| BM1684X SoC  | whisper.py       | bmwhisper_small_1684x_f16.bmodel   | 268.22                | 179.44                  | 447.66               |
-| BM1684X SoC  | whisper.py       | bmwhisper_medium_1684x_f16.bmodel  | 300.66                | 451.54                  | 752.20               |
+|    测试平台   |     测试程序      |           测试模型                  |  Preprocess time(ms) |    Inference time(ms)   |
+| -----------  | ---------------- | -----------------------------------| --------------------- | ----------------------- |
+|   SE7-32     | whisper.py       | bmwhisper_base_1684x_f16.bmodel    | 247.61                | 61.70                   |
+|   SE7-32     | whisper.py       | bmwhisper_small_1684x_f16.bmodel   | 268.22                | 179.44                  |
+|   SE7-32     | whisper.py       | bmwhisper_medium_1684x_f16.bmodel  | 300.66                | 451.54                  |
 
 > **测试说明**：
-> 1. 该性能使用datasets/test/demo.wav音频进行测试，计算后得出平均每秒音频所需推理时间
-> 2. 性能测试结果具有一定的波动性，实测结果与该表结果有误差属正常现象，建议多次测试取平均值；
-> 3. BM1684X SoC的主控处理器为8核 ARM A53 42320 DMIPS @2.3GHz。
+> 1. 该性能使用datasets/test/demo.wav音频进行测试，计算后得出平均每秒音频所需推理时间。
+> 2. whisper模型的预处理主要包括加载语音，特征提取等，推理后的结果可直接转换为自然语言，时间可忽略不计，因此无后处理部分时间统计。
+> 3. 性能测试结果具有一定的波动性，实测结果与该表结果有误差属正常现象，建议多次测试取平均值。
+> 4. BM1684X SoC的主控处理器为8核 ARM A53 42320 DMIPS @2.3GHz。
